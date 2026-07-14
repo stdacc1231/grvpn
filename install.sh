@@ -96,16 +96,69 @@ apt update && apt upgrade -y
 
 # Install core packages
 echo -e "${BLUE}[📦] Installing core packages...${NC}"
-apt install -y openssh-server nginx stunnel5 \
-    certbot python3-certbot-nginx python3-pip \
-    screen tmux ufw fail2ban redis-server \
-    sqlite3 bc net-tools iptables-persistent \
-    curl wget git unzip jq htop nload \
-    openssl netcat socat python3-bcrypt \
-    apache2-utils whois dnsutils uuid-runtime \
-    sshuttle python3-sshuttle iptables \
-    build-essential autoconf libtool pkg-config \
-    htop nload iftop iotop ncdu
+apt update
+
+apt install -y \
+openssh-server \
+nginx \
+stunnel4 \
+certbot \
+python3-certbot-nginx \
+python3-pip \
+python3-venv \
+python3-dev \
+screen \
+tmux \
+ufw \
+fail2ban \
+redis-server \
+sqlite3 \
+bc \
+net-tools \
+iptables \
+iptables-persistent \
+curl \
+wget \
+git \
+unzip \
+jq \
+htop \
+nload \
+iftop \
+iotop \
+ncdu \
+openssl \
+netcat-openbsd \
+socat \
+apache2-utils \
+whois \
+dnsutils \
+uuid-runtime \
+sshuttle \
+build-essential \
+autoconf \
+automake \
+libtool \
+pkg-config \
+ca-certificates \
+software-properties-common \
+gnupg \
+lsb-release
+
+python3 -m pip install --upgrade pip
+
+pip3 install \
+bcrypt \
+psutil \
+cryptography \
+pyOpenSSL \
+sqlalchemy \
+redis \
+requests \
+colorama \
+prettytable \
+tabulate \
+python-dateutil
 
 # Install Python packages
 echo -e "${BLUE}[🐍] Installing Python packages...${NC}"
