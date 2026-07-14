@@ -65,19 +65,15 @@ DB_FILE="${DATA_DIR}/grvpn.db"
 PORT_START=2000
 
 # Ask for domain
-echo -e "${BLUE}[🌐] Enter your domain (e.g., ssh.example.com):${NC}"
-echo -n "Domain: "
-read DOMAIN
+while true; do
+    read -r -p "Enter your domain (e.g. ssh.example.com): " DOMAIN </dev/tty
 
-if [ -z "$DOMAIN" ]; then
-    echo -e "${RED}[❌] Domain required!${NC}"
-    echo -n "Domain: "
-    read DOMAIN
-    if [ -z "$DOMAIN" ]; then
-        echo -e "${RED}[❌] No domain provided. Exiting...${NC}"
-        exit 1
+    if [[ -n "$DOMAIN" ]]; then
+        break
     fi
-fi
+
+    echo "Domain cannot be empty."
+done
 
 echo -e "${GREEN}[✅] Using domain: $DOMAIN${NC}"
 
