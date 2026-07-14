@@ -30,11 +30,18 @@ fi
 
 # Get domain
 echo -e "${BLUE}[🌐] Enter your domain (e.g., vpn.example.com):${NC}"
-read -p "Domain: " GRVPN_DOMAIN
+echo -n "Domain: "
+read GRVPN_DOMAIN
 
+# Check if domain is empty
 if [ -z "$GRVPN_DOMAIN" ]; then
-    echo -e "${RED}[❌] Domain required!${NC}"
-    exit 1
+    echo -e "${RED}[❌] Domain required! Please enter a valid domain.${NC}"
+    echo -n "Domain: "
+    read GRVPN_DOMAIN
+    if [ -z "$GRVPN_DOMAIN" ]; then
+        echo -e "${RED}[❌] No domain provided. Exiting...${NC}"
+        exit 1
+    fi
 fi
 
 echo -e "${GREEN}[✅] Using domain: $GRVPN_DOMAIN${NC}"
