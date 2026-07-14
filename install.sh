@@ -1,6 +1,6 @@
 #!/bin/bash
-# GRVPN PANEL v3.0 - DOMAIN SSL EDITION
-# Complete SSH VPN with Domain SSL Certificate
+# GRVPN PANEL v3.0 - FULL PAYLOAD SUPPORT
+# Complete SSH VPN with Payload Injection - ANY WEBSITE
 # Run as root
 
 set -e
@@ -15,9 +15,9 @@ NC='\033[0m'
 clear
 echo ""
 echo "╔══════════════════════════════════════════════════════════════════════╗"
-echo "║  🐱 GRVPN PANEL v3.0 - DOMAIN SSL EDITION                          ║"
-echo "║  Complete SSH VPN with Domain SSL Certificate                      ║"
-echo "║  SSH VPN | SSH WS | SSH TLS | Payload Injection                    ║"
+echo "║  🐱 GRVPN PANEL v3.0 - FULL PAYLOAD SUPPORT                        ║"
+echo "║  ANY WEBSITE | ANY PAYLOAD TYPE                                    ║"
+echo "║  SSH VPN | SSH WS | SSH TLS | Payload Injection                   ║"
 echo "║  ROOT PATH: /  (NO OTHER PATHS)                                    ║"
 echo "╚══════════════════════════════════════════════════════════════════════╝"
 echo ""
@@ -33,9 +33,8 @@ echo -e "${BLUE}[🌐] Enter your domain (e.g., vpn.example.com):${NC}"
 echo -n "Domain: "
 read GRVPN_DOMAIN
 
-# Check if domain is empty
 if [ -z "$GRVPN_DOMAIN" ]; then
-    echo -e "${RED}[❌] Domain required! Please enter a valid domain.${NC}"
+    echo -e "${RED}[❌] Domain required!${NC}"
     echo -n "Domain: "
     read GRVPN_DOMAIN
     if [ -z "$GRVPN_DOMAIN" ]; then
@@ -51,7 +50,8 @@ SERVER_IP=$(curl -s ifconfig.me || curl -s icanhazip.com || hostname -I | awk '{
 echo -e "${BLUE}[🌐] Server IP: $SERVER_IP${NC}"
 echo -e "${YELLOW}[⚠️] Make sure DNS A record points $GRVPN_DOMAIN -> $SERVER_IP${NC}"
 echo ""
-read -p "Press Enter to continue..."
+echo -n "Press Enter to continue..."
+read
 
 # Create directories
 echo -e "${BLUE}[📁] Creating directories...${NC}"
@@ -88,14 +88,10 @@ echo -e "${BLUE}[🌐] Installing websocat...${NC}"
 wget -q -O /usr/local/bin/websocat https://github.com/vi/websocat/releases/download/v1.12.0/websocat.x86_64-unknown-linux-musl
 chmod +x /usr/local/bin/websocat
 
-# Generate SSL certificate for domain
+# Generate SSL certificate
 echo -e "${BLUE}[🔐] Generating SSL certificate for $GRVPN_DOMAIN...${NC}"
-
-# Stop nginx first
 systemctl stop nginx 2>/dev/null || true
 
-# Try Let's Encrypt
-echo -e "${YELLOW}[🔐] Trying Let's Encrypt...${NC}"
 certbot certonly --standalone -d "$GRVPN_DOMAIN" \
     --non-interactive --agree-tos \
     -m "admin@$GRVPN_DOMAIN" \
@@ -106,7 +102,7 @@ if [ -f "/etc/letsencrypt/live/$GRVPN_DOMAIN/fullchain.pem" ]; then
     KEY_PATH="/etc/letsencrypt/live/$GRVPN_DOMAIN/privkey.pem"
     echo -e "${GREEN}[✅] Let's Encrypt certificate obtained!${NC}"
 else
-    echo -e "${YELLOW}[⚠️] Let's Encrypt failed. Using self-signed...${NC}"
+    echo -e "${YELLOW}[⚠️] Using self-signed...${NC}"
     mkdir -p "/etc/letsencrypt/live/$GRVPN_DOMAIN"
     openssl req -x509 -newkey rsa:4096 -keyout "/etc/letsencrypt/live/$GRVPN_DOMAIN/privkey.pem" \
         -out "/etc/letsencrypt/live/$GRVPN_DOMAIN/fullchain.pem" -days 365 -nodes \
@@ -115,7 +111,6 @@ else
     KEY_PATH="/etc/letsencrypt/live/$GRVPN_DOMAIN/privkey.pem"
 fi
 
-# Copy certs to standard location
 cp "$CERT_PATH" /etc/ssl/grvpn.pem
 cp "$KEY_PATH" /etc/ssl/grvpn.key
 chmod 600 /etc/ssl/grvpn.key
@@ -126,6 +121,39 @@ echo -e "${GREEN}[✅] SSL certificate installed for $GRVPN_DOMAIN${NC}"
 # Generate SSH host keys
 echo -e "${BLUE}[🔑] Generating SSH host keys...${NC}"
 ssh-keygen -A
+
+# Create payload templates - ANY WEBSITE
+echo -e "${BLUE}[📝] Creating payload templates...${NC}"
+cat > /opt/grvpn/payloads/templates.json << 'PAYLOAD_EOF'
+{
+    "payloads": {
+        "websocket": {
+            "name": "WebSocket Upgrade",
+            "template": "GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]"
+        },
+        "websocket_connection": {
+            "name": "WebSocket with Connection",
+            "template": "GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]"
+        },
+        "websocket_full": {
+            "name": "WebSocket Full Headers",
+            "template": "GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]User-Agent: Mozilla/5.0[crlf]Accept: */*[crlf][crlf]"
+        },
+        "http_get": {
+            "name": "HTTP GET",
+            "template": "GET / HTTP/1.1[crlf]Host: [host][crlf]User-Agent: Mozilla/5.0[crlf]Accept: */*[crlf][crlf]"
+        },
+        "http_connect": {
+            "name": "HTTP CONNECT",
+            "template": "CONNECT [host]:443 HTTP/1.1[crlf]Host: [host][crlf]User-Agent: Mozilla/5.0[crlf][crlf]"
+        },
+        "custom": {
+            "name": "Custom Payload",
+            "template": "[custom]"
+        }
+    }
+}
+PAYLOAD_EOF
 
 # Create dynamic banner script
 echo -e "${BLUE}[📝] Creating dynamic banner...${NC}"
@@ -139,7 +167,6 @@ if [ -z "$USERNAME" ]; then
     exit 0
 fi
 
-# Get user data
 USER_DATA=$(sqlite3 /opt/grvpn/data.db "SELECT data_limit, download_speed, upload_speed, ip_limit, bandwidth_used, connections, created_at, expires_at, ssh_banner FROM users WHERE username='$USERNAME' AND is_active=1" 2>/dev/null)
 
 if [ -z "$USER_DATA" ]; then
@@ -149,34 +176,23 @@ fi
 
 IFS='|' read -r DATA_LIMIT DL_SPEED UL_SPEED IP_LIMIT BANDWIDTH_USED CONNECTIONS CREATED_AT EXPIRES_AT SSH_BANNER <<< "$USER_DATA"
 
-# Calculate remaining data
 if [ "$DATA_LIMIT" -eq 0 ]; then
     DATA_REMAINING="∞ (Unlimited)"
     DATA_PERCENT="∞"
     DATA_USED_GB="0.00"
 else
     DATA_USED_GB=$(echo "scale=2; $BANDWIDTH_USED/1024/1024/1024" | bc 2>/dev/null)
-    if [ -z "$DATA_USED_GB" ]; then
-        DATA_USED_GB="0.00"
-    fi
+    [ -z "$DATA_USED_GB" ] && DATA_USED_GB="0.00"
     DATA_REMAINING_GB=$(echo "scale=2; ($DATA_LIMIT - ($BANDWIDTH_USED/1024/1024/1024))" | bc 2>/dev/null)
-    if [ -z "$DATA_REMAINING_GB" ] || (( $(echo "$DATA_REMAINING_GB < 0" | bc -l 2>/dev/null) )); then
-        DATA_REMAINING_GB="0.00"
-    fi
+    [ -z "$DATA_REMAINING_GB" ] || (( $(echo "$DATA_REMAINING_GB < 0" | bc -l 2>/dev/null) )) && DATA_REMAINING_GB="0.00"
     DATA_REMAINING="${DATA_REMAINING_GB}GB"
     DATA_PERCENT=$(echo "scale=0; ($DATA_USED_GB/$DATA_LIMIT)*100" | bc 2>/dev/null)
-    if [ -z "$DATA_PERCENT" ]; then
-        DATA_PERCENT="0"
-    fi
+    [ -z "$DATA_PERCENT" ] && DATA_PERCENT="0"
 fi
 
-# Get active sessions
 ACTIVE_SESSIONS=$(sqlite3 /opt/grvpn/data.db "SELECT COUNT(*) FROM sessions WHERE user_id=(SELECT id FROM users WHERE username='$USERNAME') AND is_active=1" 2>/dev/null)
-if [ -z "$ACTIVE_SESSIONS" ]; then
-    ACTIVE_SESSIONS="0"
-fi
+[ -z "$ACTIVE_SESSIONS" ] && ACTIVE_SESSIONS="0"
 
-# Get last login
 LAST_LOGIN=$(sqlite3 /opt/grvpn/data.db "SELECT ip, connected_at FROM sessions WHERE user_id=(SELECT id FROM users WHERE username='$USERNAME') AND is_active=1 ORDER BY connected_at DESC LIMIT 1" 2>/dev/null)
 if [ -n "$LAST_LOGIN" ]; then
     LAST_IP=$(echo "$LAST_LOGIN" | cut -d'|' -f1)
@@ -186,16 +202,14 @@ else
     LAST_TIME="N/A"
 fi
 
-# Get server info
 SERVER_NAME=$(hostname)
 SERVER_IP=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
 UPTIME=$(uptime -p 2>/dev/null)
 
-# Build banner
 echo ""
 echo "╔══════════════════════════════════════════════════════════════════════╗"
 echo "║  🐱 GRVPN VPN SERVER                                                ║"
-echo "║  Secure SSH VPN Tunnel - Ultimate Edition                           ║"
+echo "║  Secure SSH VPN Tunnel - Payload Edition                            ║"
 echo "╠══════════════════════════════════════════════════════════════════════╣"
 echo "║                                                                      ║"
 echo "║  👤 User: $USERNAME                                                  ║"
@@ -223,7 +237,7 @@ if [ -n "$SSH_BANNER" ]; then
     echo "$SSH_BANNER"
 else
     echo "║  💡 Welcome to GRVPN VPN Tunnel!                                  ║"
-    echo "║  📡 All traffic is encrypted and secure                          ║"
+    echo "║  📡 Payload injection enabled                                     ║"
 fi
 echo "║                                                                      ║"
 echo "╚══════════════════════════════════════════════════════════════════════╝"
@@ -278,8 +292,8 @@ AllowTcpForwarding yes
 GatewayPorts yes
 EOF
 
-# Configure Nginx with domain
-echo -e "${BLUE}[🔧] Configuring Nginx with domain $GRVPN_DOMAIN...${NC}"
+# Configure Nginx
+echo -e "${BLUE}[🔧] Configuring Nginx...${NC}"
 cat > /etc/nginx/sites-available/grvpn << EOF
 server {
     listen 80;
@@ -296,15 +310,15 @@ server {
     listen 2095;
     listen 2096 ssl;
     listen 8880;
-    
+
     server_name $GRVPN_DOMAIN;
-    
+
     ssl_certificate /etc/ssl/grvpn.pem;
     ssl_certificate_key /etc/ssl/grvpn.key;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
-    
-    # WebSocket ROOT "/"
+
+    # WebSocket ROOT "/" - PAYLOAD READY
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
@@ -314,7 +328,7 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        
+
         proxy_buffering off;
         proxy_cache off;
         proxy_read_timeout 86400;
@@ -412,25 +426,6 @@ ufw allow 8880/tcp 2>/dev/null || true
 ufw allow 8080/tcp 2>/dev/null || true
 ufw --force enable 2>/dev/null || true
 
-# Configure Fail2ban
-echo -e "${BLUE}[🛡️] Configuring fail2ban...${NC}"
-cat > /etc/fail2ban/jail.local << 'FAIL2BAN_EOF'
-[DEFAULT]
-bantime = 3600
-findtime = 600
-maxretry = 5
-
-[sshd]
-enabled = true
-port = ssh
-filter = sshd
-logpath = /var/log/auth.log
-maxretry = 3
-bantime = 7200
-FAIL2BAN_EOF
-
-systemctl restart fail2ban 2>/dev/null || true
-
 # Create database
 echo -e "${BLUE}[💾] Creating database...${NC}"
 sqlite3 /opt/grvpn/data.db << 'SQL_EOF'
@@ -450,7 +445,8 @@ CREATE TABLE IF NOT EXISTS users (
     ssh_port INTEGER,
     ws_port INTEGER,
     ssh_banner TEXT,
-    payload_config TEXT,
+    payload_template TEXT,
+    payload_custom TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     expires_at TIMESTAMP
 );
@@ -533,8 +529,8 @@ echo -e "${BLUE}[📝] Creating GRVPN panel...${NC}"
 cat > /usr/local/bin/grvpn << 'GRVPN_PANEL'
 #!/usr/bin/env python3
 """
-GRVPN PANEL v3.0 - COMPLETE CLI MANAGEMENT
-Domain SSL Edition
+GRVPN PANEL v3.0 - FULL PAYLOAD SUPPORT
+ANY WEBSITE | ANY PAYLOAD TYPE
 """
 
 import os, sys, sqlite3, subprocess, time, json, psutil, bcrypt, uuid
@@ -545,7 +541,6 @@ colorama.init()
 
 DB = '/opt/grvpn/data.db'
 
-# ============ DATABASE ============
 def get_conn():
     return sqlite3.connect(DB)
 
@@ -614,13 +609,14 @@ def log_activity(user_id, action, ip='', details=''):
 def clear_screen():
     os.system('clear' if os.name == 'posix' else 'cls')
 
-# ============ MAIN PANEL ============
+# ============ MAIN MENU ============
 def main_menu():
     while True:
         clear_screen()
         print("""
 ╔══════════════════════════════════════════════════════════════════════╗
-║  🐱 GRVPN PANEL v3.0 - DOMAIN SSL EDITION                          ║
+║  🐱 GRVPN PANEL v3.0 - FULL PAYLOAD SUPPORT                        ║
+║  ANY WEBSITE | ANY PAYLOAD TYPE                                    ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  1.  👤 User Management                                             ║
 ║  2.  📊 Monitor & Logs                                              ║
@@ -664,7 +660,8 @@ def user_menu():
         print("5. Delete User")
         print("6. Change Password")
         print("7. Set SSH Banner")
-        print("8. Back to Main")
+        print("8. Set Payload (ANY WEBSITE)")
+        print("9. Back to Main")
         
         choice = input("\nChoice: ").strip()
         if choice == '1': list_users()
@@ -674,7 +671,8 @@ def user_menu():
         elif choice == '5': delete_user()
         elif choice == '6': change_password()
         elif choice == '7': set_banner()
-        elif choice == '8': break
+        elif choice == '8': set_payload()
+        elif choice == '9': break
 
 def list_users():
     clear_screen()
@@ -685,15 +683,16 @@ def list_users():
         return
     
     table = PrettyTable()
-    table.field_names = ["ID", "Username", "Data", "DL", "UL", "IP", "Conn", "SSH", "Admin"]
+    table.field_names = ["ID", "Username", "Data", "DL", "UL", "IP", "Conn", "SSH", "Admin", "Payload"]
     for u in users:
         data = f"{u['data_limit']}GB" if u['data_limit'] > 0 else "∞"
         dl = f"{u['download_speed']}M" if u['download_speed'] > 0 else "∞"
         ul = f"{u['upload_speed']}M" if u['upload_speed'] > 0 else "∞"
         ip = f"{u['ip_limit']}" if u['ip_limit'] > 0 else "∞"
+        payload = u.get('payload_template', 'None') or 'None'
         table.add_row([u['id'], u['username'][:15], data, dl, ul, ip, 
                        u.get('connections',0), u.get('ssh_port','N/A'), 
-                       "✅" if u['is_admin'] else "❌"])
+                       "✅" if u['is_admin'] else "❌", payload[:10]])
     print(table)
     input("\nPress Enter...")
 
@@ -889,6 +888,89 @@ def set_banner():
     
     print("[✅] Banner set!")
     input("Press Enter...")
+
+# ============ PAYLOAD CONFIGURATION ============
+def set_payload():
+    clear_screen()
+    username = input("Username: ").strip()
+    user = get_user(username)
+    if not user:
+        print("[❌] User not found!")
+        input("Press Enter...")
+        return
+    
+    print("\n📡 PAYLOAD CONFIGURATION - ANY WEBSITE")
+    print("="*60)
+    print("""
+PAYLOAD TEMPLATES (Replace [host] with your domain):
+1. WebSocket Upgrade:
+   GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]
+
+2. WebSocket with Connection:
+   GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]
+
+3. WebSocket Full Headers:
+   GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]User-Agent: Mozilla/5.0[crlf]Accept: */*[crlf][crlf]
+
+4. HTTP GET:
+   GET / HTTP/1.1[crlf]Host: [host][crlf]User-Agent: Mozilla/5.0[crlf]Accept: */*[crlf][crlf]
+
+5. HTTP CONNECT:
+   CONNECT [host]:443 HTTP/1.1[crlf]Host: [host][crlf]User-Agent: Mozilla/5.0[crlf][crlf]
+
+6. Custom Payload (ANY WEBSITE):
+   Enter your own payload
+""")
+    
+    choice = input("\nSelect template (1-6): ").strip()
+    
+    templates = {
+        '1': 'GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]',
+        '2': 'GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]',
+        '3': 'GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]User-Agent: Mozilla/5.0[crlf]Accept: */*[crlf][crlf]',
+        '4': 'GET / HTTP/1.1[crlf]Host: [host][crlf]User-Agent: Mozilla/5.0[crlf]Accept: */*[crlf][crlf]',
+        '5': 'CONNECT [host]:443 HTTP/1.1[crlf]Host: [host][crlf]User-Agent: Mozilla/5.0[crlf][crlf]',
+    }
+    
+    if choice == '6':
+        print("\n📝 Enter custom payload:")
+        print("Use [host] for domain replacement")
+        print("Use [crlf] for new lines")
+        payload = input("Payload: ").strip()
+        payload_type = 'custom'
+    elif choice in templates:
+        payload = templates[choice]
+        payload_type = 'template_' + choice
+    else:
+        print("[❌] Invalid choice!")
+        input("Press Enter...")
+        return
+    
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN payload_template TEXT")
+        c.execute("ALTER TABLE users ADD COLUMN payload_custom TEXT")
+    except:
+        pass
+    
+    if choice == '6':
+        c.execute("UPDATE users SET payload_custom=?, payload_template='custom' WHERE id=?", (payload, user['id']))
+    else:
+        c.execute("UPDATE users SET payload_template=?, payload_custom=NULL WHERE id=?", (payload_type, user['id']))
+    
+    conn.commit()
+    conn.close()
+    
+    # Generate connection string
+    conn_string = payload.replace('[host]', '$GRVPN_DOMAIN')
+    
+    print(f"\n[✅] Payload configured for {username}!")
+    print("\n📋 GENERATED PAYLOAD:")
+    print("="*60)
+    print(conn_string)
+    print("\n💡 Copy this payload into your VPN app (HTTP Custom, KPN, etc.)")
+    input("\nPress Enter...")
 
 # ============ MONITOR MENU ============
 def monitor_menu():
@@ -1194,10 +1276,8 @@ def change_domain():
         input("Press Enter...")
         return
     
-    # Stop services
     subprocess.run(['systemctl', 'stop', 'nginx'], check=False)
     
-    # Get new cert
     print(f"[🔐] Getting SSL for {new_domain}...")
     certbot certonly --standalone -d "$new_domain" \
         --non-interactive --agree-tos \
@@ -1207,14 +1287,12 @@ def change_domain():
         subprocess.run(f"cp /etc/letsencrypt/live/{new_domain}/fullchain.pem /etc/ssl/grvpn.pem", shell=True)
         subprocess.run(f"cp /etc/letsencrypt/live/{new_domain}/privkey.pem /etc/ssl/grvpn.key", shell=True)
         
-        # Update domain in DB
         conn = get_conn()
         c = conn.cursor()
         c.execute("UPDATE settings SET value=? WHERE key='domain'", (new_domain,))
         conn.commit()
         conn.close()
         
-        # Update Nginx
         subprocess.run(f"sed -i 's/server_name .*/server_name {new_domain};/g' /etc/nginx/sites-available/grvpn", shell=True)
         subprocess.run(['systemctl', 'reload', 'nginx'], check=False)
         
@@ -1317,7 +1395,6 @@ def view_logs():
 def connect_info():
     clear_screen()
     
-    # Get domain
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT value FROM settings WHERE key='domain'")
@@ -1325,7 +1402,7 @@ def connect_info():
     conn.close()
     domain = domain_row[0] if domain_row else "YOUR_DOMAIN"
     
-    print("\n🚀 CONNECTION INFO - ROOT PATH \"/\"")
+    print("\n🚀 CONNECTION INFO - PAYLOAD EDITION")
     print("="*70)
     print(f"Domain: {domain}")
     print()
@@ -1342,6 +1419,17 @@ def connect_info():
     print(f"   wss://{domain}/")
     print(f"   websocat -v ws://{domain}/")
     print(f"   websocat -v wss://{domain}/")
+    
+    print("\n📡 PAYLOAD EXAMPLES (ANY WEBSITE):")
+    print("="*70)
+    print("1. WebSocket Upgrade:")
+    print(f"   GET / HTTP/1.1[crlf]Host: {domain}[crlf]Upgrade: websocket[crlf][crlf]")
+    print()
+    print("2. WebSocket Full:")
+    print(f"   GET / HTTP/1.1[crlf]Host: {domain}[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]")
+    print()
+    print("3. HTTP GET:")
+    print(f"   GET / HTTP/1.1[crlf]Host: {domain}[crlf]User-Agent: Mozilla/5.0[crlf][crlf]")
     
     users = get_all_users()
     if users:
@@ -1423,6 +1511,7 @@ nohup websocat -s 0.0.0.0:8080 -- sh -c "ssh -o StrictHostKeyChecking=no localho
 echo -e "${GREEN}"
 echo "╔══════════════════════════════════════════════════════════════════════╗"
 echo "║  🐱 GRVPN PANEL v3.0 INSTALLATION COMPLETE!                        ║"
+echo "║  FULL PAYLOAD SUPPORT - ANY WEBSITE                                ║"
 echo "╠══════════════════════════════════════════════════════════════════════╣"
 echo "║                                                                      ║"
 echo "║  Run: grvpn                                                          ║"
@@ -1430,6 +1519,10 @@ echo "║  Login: grvpn / GRVPN@2026                                          �
 echo "║                                                                      ║"
 echo "║  🌐 Domain: $GRVPN_DOMAIN                                            ║"
 echo "║  📡 SSL Certificate: Valid for $GRVPN_DOMAIN                        ║"
+echo "║                                                                      ║"
+echo "║  📡 PAYLOAD EXAMPLES (ANY WEBSITE):                                  ║"
+echo "║  GET / HTTP/1.1[crlf]Host: $GRVPN_DOMAIN[crlf]Upgrade: websocket[crlf][crlf]"
+echo "║  GET / HTTP/1.1[crlf]Host: $GRVPN_DOMAIN[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]"
 echo "║                                                                      ║"
 echo "║  📡 CONNECTION METHODS:                                              ║"
 echo "║  SSH Direct: ssh -p 22 username@$GRVPN_DOMAIN                       ║"
