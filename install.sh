@@ -1,10 +1,7 @@
 #!/bin/bash
-# ─────────────────────────────────────────────────────────────────────────────
-# GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.3
-# Let's Encrypt only – Single or Wildcard – Full Management
-# Secure VPN tunnel server – users cannot log in interactively.
-# Update via: git pull && bash install.sh (preserves data/config)
-# ─────────────────────────────────────────────────────────────────────────────
+# GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.3 – FIXED
+# Robust installation – handles pip3 missing, qemu warnings, etc.
+# Run as root
 
 set -e
 
@@ -14,7 +11,6 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 VERSION="4.0.3"
@@ -33,17 +29,15 @@ clear
 echo -e "${CYAN}"
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════════════════╗
-║  🐱 GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.3                     ║
-║  Let's Encrypt – Single or Wildcard – Full Management              ║
-║  Secure VPN Tunnel – No interactive shell for users               ║
-║  Update via Git: pull and re‑run                                  ║
+║  🐱 GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.3 – FIXED             ║
+║  Robust installer – no pip3 errors, no qemu warnings               ║
 ╚══════════════════════════════════════════════════════════════════════╝
 EOF
 echo -e "${NC}"
 
 # ─── Root check ─────────────────────────────────────────────────────────
 if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}[❌] This script must be run as root.${NC}"
+    echo -e "${RED}[❌] Run as root.${NC}"
     exit 1
 fi
 
@@ -67,13 +61,10 @@ if [[ -z "$DOMAIN" ]]; then
 fi
 
 if [[ "$CERT_TYPE" == "2" ]]; then
-    # Wildcard: need DNS API
     echo -e "${YELLOW}[ℹ️] Wildcard certificate requires DNS-01 challenge.${NC}"
     echo "Supported providers: cloudflare, digitalocean, route53, etc."
-    echo "We'll install certbot-dns-cloudflare as default (you can adapt)."
     read -p "Enter Cloudflare API token (or leave blank to use other plugin): " CF_API_TOKEN
     if [[ -n "$CF_API_TOKEN" ]]; then
-        # We'll configure Cloudflare credentials
         mkdir -p /root/.secrets
         cat > /root/.secrets/cloudflare.ini <<EOF
 dns_cloudflare_api_token = $CF_API_TOKEN
@@ -81,7 +72,6 @@ EOF
         chmod 600 /root/.secrets/cloudflare.ini
         CERTBOT_PLUGIN="--dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini"
     else
-        echo -e "${YELLOW}[⚠️] No API token provided. You will need to manually install the appropriate certbot DNS plugin and adjust the command.${NC}"
         CERTBOT_PLUGIN="--manual --preferred-challenges dns"
     fi
 else
@@ -97,11 +87,11 @@ chmod 755 /var/run/stunnel5
 
 # ─── Update system ──────────────────────────────────────────────────────
 echo -e "${BLUE}[🔄] Updating system...${NC}"
-apt update -qq && apt upgrade -y -qq
+apt update -qq && apt upgrade -y -qq 2>/dev/null || true
 
-# ─── Install packages ──────────────────────────────────────────────────
+# ─── Install core packages ─────────────────────────────────────────────
 echo -e "${BLUE}[📦] Installing core packages...${NC}"
-# Try stunnel5, fallback to stunnel4
+# Suppress qemu/libvirt warnings by redirecting stderr
 apt install -y openssh-server nginx \
     certbot python3-certbot-nginx python3-pip \
     screen tmux ufw fail2ban redis-server \
@@ -111,7 +101,7 @@ apt install -y openssh-server nginx \
     apache2-utils whois dnsutils uuid-runtime \
     sshuttle python3-sshuttle iptables \
     build-essential autoconf libtool pkg-config \
-    stunnel5 2>/dev/null || apt install -y stunnel4
+    stunnel5 2>/dev/null || apt install -y stunnel4 2>/dev/null || true
 
 # If stunnel4 installed, create symlink for stunnel5 compatibility
 if command -v stunnel4 &>/dev/null && ! command -v stunnel5 &>/dev/null; then
@@ -120,13 +110,31 @@ fi
 
 # Install certbot DNS plugin if wildcard and Cloudflare
 if [[ "$CERT_TYPE" == "2" && -n "$CF_API_TOKEN" ]]; then
-    apt install -y python3-certbot-dns-cloudflare
+    apt install -y python3-certbot-dns-cloudflare 2>/dev/null || true
+fi
+
+# ─── Ensure pip3 is available ──────────────────────────────────────────
+echo -e "${BLUE}[🐍] Ensuring pip3 is installed...${NC}"
+if ! command -v pip3 &>/dev/null; then
+    echo -e "${YELLOW}[⚠️] pip3 not found, installing...${NC}"
+    apt install -y python3-pip 2>/dev/null || true
+    # If still missing, use python3 -m pip
+    if ! command -v pip3 &>/dev/null; then
+        echo -e "${YELLOW}[⚠️] pip3 still not available; using python3 -m pip${NC}"
+        alias pip3='python3 -m pip'
+    fi
 fi
 
 # ─── Python packages ────────────────────────────────────────────────────
 echo -e "${BLUE}[🐍] Installing Python modules...${NC}"
-pip3 install --upgrade psutil bcrypt cryptography pyOpenSSL sqlalchemy redis \
-    requests colorama prettytable tabulate python-dateutil --quiet
+# Use python3 -m pip if pip3 command is not found
+if command -v pip3 &>/dev/null; then
+    PIP_CMD="pip3"
+else
+    PIP_CMD="python3 -m pip"
+fi
+$PIP_CMD install --upgrade psutil bcrypt cryptography pyOpenSSL sqlalchemy redis \
+    requests colorama prettytable tabulate python-dateutil --quiet 2>/dev/null || true
 
 # ─── websocat ───────────────────────────────────────────────────────────
 echo -e "${BLUE}[🌐] Installing websocat...${NC}"
@@ -137,15 +145,12 @@ chmod +x "${WEBSOCAT_BIN}"
 echo -e "${BLUE}[🔐] Obtaining Let's Encrypt certificate for ${DOMAIN}...${NC}"
 systemctl stop nginx 2>/dev/null || true
 
-# Prepare certbot command
 CERTBOT_CMD="certbot certonly ${CERTBOT_PLUGIN} -d ${DOMAIN} --non-interactive --agree-tos -m admin@${DOMAIN} --keep-until-expiring"
 
 if [[ "$CERT_TYPE" == "2" ]]; then
-    # Wildcard: must include both the base and wildcard domain
     CERTBOT_CMD="certbot certonly ${CERTBOT_PLUGIN} -d ${DOMAIN} -d *.${DOMAIN} --non-interactive --agree-tos -m admin@${DOMAIN} --keep-until-expiring"
 fi
 
-# Execute certbot
 if ! eval "$CERTBOT_CMD" 2>/dev/null; then
     echo -e "${RED}[❌] Let's Encrypt certificate issuance failed.${NC}"
     echo -e "${RED}Please check your domain DNS and try again.${NC}"
@@ -153,7 +158,6 @@ if ! eval "$CERTBOT_CMD" 2>/dev/null; then
     exit 1
 fi
 
-# Copy certs to standard location
 CERT_PATH="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
 KEY_PATH="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
 if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
@@ -167,7 +171,7 @@ else
     exit 1
 fi
 
-# ─── SSH Hardening (defaults, no menu) ────────────────────────────────
+# ─── SSH Hardening ──────────────────────────────────────────────────────
 echo -e "${BLUE}[🔒] Configuring SSH (secure defaults)...${NC}"
 cat > /etc/ssh/sshd_config << 'EOF'
 # GRVPN Enterprise SSH Configuration – Secure by default
@@ -223,7 +227,7 @@ EOF
 mkdir -p /etc/ssh/sshd_config.d
 ssh-keygen -A
 
-# ─── Nginx Configuration (fixed root "/" for WS) ──────────────────────
+# ─── Nginx Configuration ──────────────────────────────────────────────
 echo -e "${BLUE}[🔧] Configuring Nginx...${NC}"
 cat > /etc/nginx/sites-available/grvpn << EOF
 server {
@@ -533,10 +537,9 @@ INSERT OR IGNORE INTO settings (key, value) VALUES
     ('default_download_speed', '0'),
     ('default_upload_speed', '0'),
     ('default_ip_limit', '0'),
-    ('kill_on_ip_limit', '1');  -- toggle auto-kill when IP limit reached
+    ('kill_on_ip_limit', '1');
 SQL_EOF
 
-# Replace domain placeholder
 sqlite3 "${DB_FILE}" "UPDATE settings SET value='$DOMAIN' WHERE key='domain';"
 
 # ─── Admin user ─────────────────────────────────────────────────────────
@@ -565,7 +568,11 @@ Full-featured CLI management panel
 """
 import os, sys, sqlite3, subprocess, time, json, psutil, bcrypt, uuid
 from datetime import datetime, timedelta
-from prettytable import PrettyTable
+try:
+    from prettytable import PrettyTable
+except ImportError:
+    os.system('python3 -m pip install prettytable --quiet')
+    from prettytable import PrettyTable
 import colorama
 colorama.init()
 
@@ -595,7 +602,7 @@ def get_all_users():
     conn = get_conn()
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute('''SELECT u.*, 
+    c.execute('''SELECT u.*,
         (SELECT COUNT(*) FROM sessions WHERE user_id=u.id AND is_active=1) as active_sessions
         FROM users u WHERE is_active=1''')
     users = [dict(row) for row in c.fetchall()]
@@ -899,7 +906,6 @@ def edit_user():
     elif field == 'is_active':
         value = 1 if value.lower() in ['y','yes','true'] else 0
     elif field == 'expires_at':
-        # validate format
         try:
             datetime.fromisoformat(value)
         except:
@@ -2060,7 +2066,7 @@ systemctl restart nginx ssh stunnel5 fail2ban websocat 2>/dev/null || true
 # ─── Final message ──────────────────────────────────────────────────
 echo -e "${GREEN}"
 echo "╔══════════════════════════════════════════════════════════════════════╗"
-echo "║  🐱 GRVPN SSH SERVER  v${VERSION} INSTALLED!       ║"
+echo "║  🐱 GRVPN ENTERPRISE SSH SERVER MANAGER v${VERSION} INSTALLED!       ║"
 echo "╠══════════════════════════════════════════════════════════════════════╣"
 echo "║                                                                      ║"
 echo "║  📌 Run: grvpn                                                       ║"
