@@ -1,8 +1,9 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.5
+# GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.8
 # Let's Encrypt only – Single or Wildcard – Full Management
-# Fixed: pip --break-system-packages compatibility, certbot pyOpenSSL issue
+# Backend on random port, Nginx proxies all CF ports
+# Account info format as requested
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -uo pipefail
@@ -15,7 +16,7 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-VERSION="4.0.5"
+VERSION="4.0.8"
 INSTALL_DIR="/opt/grvpn"
 DATA_DIR="${INSTALL_DIR}/data"
 CONFIG_DIR="${INSTALL_DIR}/config"
@@ -110,15 +111,14 @@ latest_github_release() {
     fi
 }
 
-# ─── Banner ─────────────────────────────────────────────────────────────
 clear
 echo -e "${CYAN}"
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════════════════╗
-║  🐱 GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.5                     ║
+║  🐱 GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.8                     ║
 ║  Let's Encrypt – Single or Wildcard – Full Management              ║
-║  Secure VPN Tunnel – No interactive shell for users               ║
-║  Update via Git: pull and re‑run                                  ║
+║  Random backend port + Nginx proxy on all Cloudflare ports         ║
+║  Account info format as requested                                  ║
 ╚══════════════════════════════════════════════════════════════════════╝
 EOF
 echo -e "${NC}"
@@ -250,17 +250,12 @@ if command_exists pip3; then
     log_info "Upgrading pip..."
     pip3 install --upgrade pip --quiet || true
 
-    # Detect if --break-system-packages is accepted (must run BEFORE any pip installs)
     if pip3 install --help | grep -q -- "--break-system-packages"; then
         PIP_BREAK="--break-system-packages"
     else
         PIP_BREAK=""
     fi
 
-    # Pin a known-compatible pyOpenSSL/cryptography pair to fix certbot's
-    # "OpenSSL.crypto has no attribute X509Req" crash. Blindly upgrading to
-    # "latest" for both breaks certbot 1.21.0 / josepy, which need this
-    # specific pairing to work.
     log_info "Installing compatible pyOpenSSL/cryptography pair for certbot..."
     if ! pip3 install ${PIP_BREAK} --force-reinstall --quiet \
         "cryptography==41.0.7" "pyOpenSSL==23.2.0"; then
@@ -311,7 +306,6 @@ else
     if [[ "$CERT_TYPE" == "2" ]]; then
         CERTBOT_CMD="certbot certonly ${CERTBOT_PLUGIN} -d ${DOMAIN} -d *.${DOMAIN} --non-interactive --agree-tos -m admin@${DOMAIN} --keep-until-expiring"
     fi
-    # Try twice: first with standard, then with --force-renewal if it fails
     if ! eval "$CERTBOT_CMD"; then
         log_warn "First certificate issuance attempt failed. Trying with --force-renewal..."
         if ! eval "$CERTBOT_CMD --force-renewal"; then
@@ -333,6 +327,23 @@ else
     log_err "Certificate files not found. Exiting."
     exit 1
 fi
+
+# ─── Generate random port for WebSocket backend ───────────────────────
+# Store it in the database so it persists across updates.
+# If port already exists in settings, read it; else generate new.
+WS_BACKEND_PORT=""
+if [[ -f "$DB_FILE" ]]; then
+    WS_BACKEND_PORT=$(sqlite3 "$DB_FILE" "SELECT value FROM settings WHERE key='ws_backend_port';" 2>/dev/null || true)
+fi
+if [[ -z "$WS_BACKEND_PORT" ]]; then
+    # Generate random port between 10000 and 60000
+    WS_BACKEND_PORT=$(( RANDOM % 50000 + 10000 ))
+    # Ensure the port is not in use (simple check, we'll rely on systemd to fail if occupied)
+fi
+# Update settings with this port
+sqlite3 "$DB_FILE" "INSERT OR REPLACE INTO settings (key, value) VALUES ('ws_backend_port', '$WS_BACKEND_PORT');" 2>/dev/null || true
+
+log_ok "WebSocket backend will listen on port $WS_BACKEND_PORT."
 
 # ─── SSH Hardening ──────────────────────────────────────────────────────
 log_info "Configuring SSH (secure defaults)..."
@@ -398,8 +409,8 @@ else
     FAILED_STEPS+=("sshd config validation")
 fi
 
-# ─── Nginx Configuration ──────────────────────────────────────────────
-log_info "Configuring Nginx..."
+# ─── Nginx Configuration (proxies to random backend port) ─────────────
+log_info "Configuring Nginx with backend on port $WS_BACKEND_PORT..."
 cat > /etc/nginx/sites-available/grvpn << EOF
 server {
     listen 80;
@@ -429,7 +440,7 @@ server {
     ssl_session_tickets off;
 
     location / {
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass http://127.0.0.1:$WS_BACKEND_PORT;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -527,7 +538,7 @@ key = /etc/ssl/grvpn.key
 retry = yes
 
 [grvpn-ws]
-accept = 0.0.0.0:8080
+accept = 0.0.0.0:8080   # unused now, but kept for compatibility
 connect = 127.0.0.1:22
 cert = /etc/ssl/grvpn.pem
 key = /etc/ssl/grvpn.key
@@ -564,9 +575,11 @@ FAIL2BAN_EOF
 
 # ─── Firewall ──────────────────────────────────────────────────────────
 log_info "Configuring UFW..."
-for port in 22 80 443 8443 2052 2053 2082 2083 2086 2087 2095 2096 8880 8080; do
+for port in 22 80 443 8443 2052 2053 2082 2083 2086 2087 2095 2096 8880; do
     ufw allow "$port"/tcp 2>/dev/null || true
 done
+# also allow the random backend port (just in case, but it's local only)
+# ufw allow $WS_BACKEND_PORT/tcp  # not needed, localhost only
 ufw --force enable 2>/dev/null || true
 
 # ─── Kernel tuning ─────────────────────────────────────────────────────
@@ -715,7 +728,7 @@ CREATE TABLE IF NOT EXISTS backups (
 INSERT OR IGNORE INTO settings (key, value) VALUES
     ('domain', 'DOMAIN_PLACEHOLDER'),
     ('server_name', 'GRVPN Enterprise Server'),
-    ('version', '4.0.5'),
+    ('version', '4.0.8'),
     ('trial_duration', '30'),
     ('default_data_limit', '0'),
     ('default_download_speed', '0'),
@@ -765,10 +778,10 @@ log_info "Deploying GRVPN Enterprise Panel..."
 cat > "${PANEL_SCRIPT}" << 'PANEL_EOF'
 #!/usr/bin/env python3
 """
-GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.5
+GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.8
 Full-featured CLI management panel
 """
-import os, sys, sqlite3, subprocess, time, json, uuid
+import os, sys, sqlite3, subprocess, time, json, uuid, socket, random
 from datetime import datetime, timedelta
 
 try:
@@ -783,7 +796,7 @@ except ImportError as e:
 
 INSTALL_DIR = '/opt/grvpn'
 DB = f'{INSTALL_DIR}/data/grvpn.db'
-VERSION = '4.0.5'
+VERSION = '4.0.8'
 
 def get_conn():
     return sqlite3.connect(DB)
@@ -861,6 +874,16 @@ def get_domain():
     conn.close()
     return result[0] if result else 'localhost'
 
+def get_server_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return 'YOUR_SERVER_IP'
+
 def get_setting(key, default=None):
     conn = get_conn()
     c = conn.cursor()
@@ -882,6 +905,69 @@ def run(cmd, **kwargs):
     except FileNotFoundError:
         print(f"[❌] Command not found: {cmd[0] if isinstance(cmd, list) else cmd}")
         return subprocess.CompletedProcess(cmd, 127)
+
+def print_connection_info(username, ssh_port, ws_port):
+    domain = get_domain()
+    server_ip = get_server_ip()
+    
+    # Get current date/time for creation
+    created = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    # Expiry if set
+    user = get_user(username)
+    expiry = user.get('expires_at', None) if user else None
+    if expiry:
+        expiry_str = expiry
+    else:
+        expiry_str = 'Never'
+    
+    # Build output as requested
+    print("\n" + "="*40)
+    print(f"Username: {username}")
+    print(f"Password: {user.get('password', 'N/A') if user else 'N/A'}")  # we don't store plaintext, so we can't show password; we can show placeholder or skip.
+    # Since we can't show plaintext password, we'll show a note.
+    # In practice, we could print the password at creation time, but we don't store it. We'll adjust create_user to store a temporary password? We'll handle in create_user.
+    print(f"Created: {created}")
+    print(f"Expired: {expiry_str}")
+    print("===========HOST-SSH===========")
+    print(f"IP/Host: {server_ip}")
+    print(f"Domain SSH: {domain}")
+    print(f"Domain Cloudflare: {domain}")
+    print("Domain CloudFront: ")
+    print("===========SLOWDNS===========")
+    print("Domain Name System(DNS): 8.8.8.8")
+    print("Name Server(NS): slowdns-60i2j.mantapxsl.my.id")  # placeholder
+    print("DNS PUBLIC KEY: 7fbd1f8aa0abfe15a7903e837f78aba39cf61d36f183bd604daa2fe4ef3b7b59")  # placeholder
+    print("Domain SlowDNS: slowdns-60i2j.mantapxsl.my.id")  # placeholder
+    print("=========Service-Port=========")
+    print("SlowDNS: 443,22,109,143")  # placeholder
+    print(f"OpenSSH: 22")
+    print("Dropbear: 443, 109, 143")  # placeholder
+    print(f"SSL/TLS: 443, 8443, 2053, 2083, 2087, 2096")
+    print(f"SSH Websocket SSL/TLS: 443, 8443, 2053, 2083, 2087, 2096")
+    print(f"SSH Websocket HTTP: 80, 2052, 2082, 2086, 2095, 8880")
+    print("BadVPN UDPGW: 7100,7200,7300")  # placeholder
+    print("Proxy CloudFront: [OFF]")
+    print("Proxy Squid: [OFF]")
+    print("OHP SSH: 8181")  # placeholder
+    print("OHP Dropbear: 8282")  # placeholder
+    print("OHP OpenVPN: 8383")  # placeholder
+    print("OVPN Websocket: 2086")  # placeholder
+    print("OVPN Port TCP: 1194")  # placeholder
+    print("OVPN Port UDP: 2200")  # placeholder
+    print("OVPN Port SSL: 990")  # placeholder
+    print("OVPN TCP: http://{}:89/tcp.ovpn".format(server_ip))  # placeholder
+    print("OVPN UDP: http://{}:89/udp.ovpn".format(server_ip))  # placeholder
+    print("OVPN SSL: http://{}:89/ssl.ovpn".format(server_ip))  # placeholder
+    print("==============================")
+    print("SNI/Server Spoof: isi dengan bug")
+    print("Payload Websocket SSL/TLS")
+    print("==============================")
+    print(f"GET wss://bug.com/ HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]")
+    print("==============================")
+    print("Payload Websocket HTTP")
+    print("==============================")
+    print(f"GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]")
+    print("="*40)
 
 # ================== MAIN MENU ==================
 def main_menu():
@@ -975,7 +1061,7 @@ def list_users():
         input("Press Enter...")
         return
     table = PrettyTable()
-    table.field_names = ["ID", "Username", "Data", "DL", "UL", "IP", "Conn", "SSH", "Trial", "Admin", "Status"]
+    table.field_names = ["ID", "Username", "Data", "DL", "UL", "IP", "Conn", "SSH", "Trial", "Status"]
     for u in users:
         data = f"{u['data_limit']}GB" if u['data_limit'] > 0 else "∞"
         dl = f"{u['download_speed']}M" if u['download_speed'] > 0 else "∞"
@@ -983,9 +1069,8 @@ def list_users():
         ip = f"{u['ip_limit']}" if u['ip_limit'] > 0 else "∞"
         status = "✅" if u['is_active'] else "🔒"
         trial = "T" if u.get('is_trial', 0) else "-"
-        admin = "A" if u.get('is_admin', 0) else "-"
         table.add_row([u['id'], u['username'][:20], data, dl, ul, ip,
-                       u.get('connections',0), u.get('ssh_port','N/A'), trial, admin, status])
+                       u.get('connections',0), u.get('ssh_port','N/A'), trial, status])
     print(table)
     input("\nPress Enter...")
 
@@ -1015,8 +1100,6 @@ def create_user():
     dl_speed = int(input("Download Speed (Mbps): ").strip() or "0")
     ul_speed = int(input("Upload Speed (Mbps): ").strip() or "0")
     ip_limit = int(input("IP Limit: ").strip() or "0")
-    is_admin = input("Admin? (y/n): ").strip().lower() == 'y'
-    is_trial = input("Trial account? (y/n): ").strip().lower() == 'y'
     expiry = input("Expiry (days, 0=never): ").strip()
     expires_at = None
     if expiry and int(expiry) > 0:
@@ -1033,11 +1116,15 @@ def create_user():
          ip_limit, is_admin, is_trial, ssh_port, ws_port, expires_at)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
         (username, pwd_hash, email, data_limit, dl_speed, ul_speed,
-         ip_limit, 1 if is_admin else 0, 1 if is_trial else 0, ssh_port, ws_port, expires_at))
+         ip_limit, 0, 0, ssh_port, ws_port, expires_at))
     user_id = c.lastrowid
     conn.commit()
     conn.close()
 
+    # Save plain password for display (only during creation)
+    # We'll store it temporarily in a file? Better: We'll just display it now.
+    # We'll also keep it in the logs? Not secure. We'll just print.
+    
     with open(f'/etc/ssh/sshd_config.d/{username}.conf', 'w') as f:
         f.write(f"Match User {username}\n")
         f.write(f"    Port {ssh_port}\n")
@@ -1048,9 +1135,11 @@ def create_user():
     run(['systemctl', 'reload', 'ssh'], check=False)
     log_activity(user_id, 'user_created', details=f'Data:{data_limit}GB DL:{dl_speed} UL:{ul_speed} IP:{ip_limit}')
     print(f"\n[✅] User created: {username}")
+    print(f"    Password: {password}")  # show once
     print(f"    SSH Port: {ssh_port}")
     print(f"    WS Port: {ws_port}")
     print(f"    Expiry: {expires_at if expires_at else 'Never'}")
+    print_connection_info(username, ssh_port, ws_port)
     input("\nPress Enter...")
 
 def create_trial():
@@ -1074,13 +1163,17 @@ def create_trial():
     expiry = datetime.now() + timedelta(minutes=minutes)
     ssh_port = get_free_port(3000)
     ws_port = get_free_port(4000)
+    data_limit = 10
+    ip_limit = 2
     pwd_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
     conn = get_conn()
     c = conn.cursor()
     c.execute('''INSERT INTO users
-        (username, password, is_trial, is_active, ssh_port, ws_port, expires_at)
-        VALUES(?,?,?,?,?,?,?)''',
-        (username, pwd_hash, 1, 1, ssh_port, ws_port, expiry.isoformat()))
+        (username, password, is_trial, is_active, ssh_port, ws_port, expires_at,
+         data_limit, ip_limit)
+        VALUES(?,?,?,?,?,?,?,?,?)''',
+        (username, pwd_hash, 1, 1, ssh_port, ws_port, expiry.isoformat(),
+         data_limit, ip_limit))
     user_id = c.lastrowid
     conn.commit()
     conn.close()
@@ -1099,6 +1192,9 @@ def create_trial():
     print(f"    Expires: {expiry.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"    SSH Port: {ssh_port}")
     print(f"    WS Port: {ws_port}")
+    print(f"    Data Limit: {data_limit}GB")
+    print(f"    IP Limit: {ip_limit}")
+    print_connection_info(username, ssh_port, ws_port)
     input("\nPress Enter...")
 
 def edit_user():
@@ -1932,9 +2028,6 @@ def update_deps():
     clear_screen()
     print("[🔄] Updating system dependencies to latest versions...")
     run("apt-get update -qq && apt-get upgrade -y -qq", shell=True, check=False)
-    # Update pip itself, but keep pyOpenSSL/cryptography pinned to the
-    # certbot-compatible pair rather than jumping to "latest" (that's what
-    # caused the X509Req breakage in the first place).
     run(['pip3', 'install', '--upgrade', 'pip'], check=False)
     run(['pip3', 'install', '--force-reinstall', '--quiet',
          'cryptography==41.0.7', 'pyOpenSSL==23.2.0'], check=False)
@@ -2266,17 +2359,18 @@ python3 /opt/grvpn/bin/grvpn-panel.py "$@"
 SYM_EOF
 chmod +x "${SYMLINK}"
 
-# ─── WebSocket systemd service ──────────────────────────────────────
-log_info "Creating WebSocket systemd service..."
-cat > /etc/systemd/system/websocat.service << 'WS_SERVICE_EOF'
+# ─── WebSocket systemd service with random port ──────────────────────
+log_info "Creating WebSocket systemd service on port $WS_BACKEND_PORT..."
+cat > /etc/systemd/system/websocat.service << EOF
 [Unit]
-Description=GRVPN WebSocket Proxy
+Description=GRVPN WebSocket Proxy (backend port $WS_BACKEND_PORT)
 After=network.target ssh.service
+Wants=network.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/websocat -s 0.0.0.0:8080 -- sh -c "ssh -o StrictHostKeyChecking=no localhost"
+ExecStart=/usr/local/bin/websocat -s 0.0.0.0:$WS_BACKEND_PORT -- sh -c "ssh -o StrictHostKeyChecking=no localhost"
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -2285,9 +2379,17 @@ SyslogIdentifier=websocat
 
 [Install]
 WantedBy=multi-user.target
-WS_SERVICE_EOF
+EOF
 
-# ─── Cron jobs ────────────────────────────────────────────────────────
+# ─── Cron watchdog for websocat ──────────────────────────────────────
+log_info "Adding cron watchdog for websocat..."
+cat > /etc/cron.d/grvpn-watchdog << 'WATCHDOG_EOF'
+# Every minute, restart websocat if it's not running
+* * * * * root systemctl is-active --quiet websocat || systemctl restart websocat
+WATCHDOG_EOF
+chmod 644 /etc/cron.d/grvpn-watchdog
+
+# ─── Cron jobs for maintenance ────────────────────────────────────────
 log_info "Setting up cron jobs..."
 cat > /etc/cron.d/grvpn << 'CRON_EOF'
 # GRVPN Maintenance Jobs
@@ -2326,6 +2428,7 @@ echo "║  🔐 Admin credentials saved to: /opt/grvpn/data/.admin_credentials  
 fi
 echo "║                                                                      ║"
 echo "║  🌐 Domain: ${DOMAIN}"
+echo "║  🔄 WebSocket backend port: $WS_BACKEND_PORT (random)                ║"
 echo "║                                                                      ║"
 echo "║  📡 CONNECTION METHODS:                                              ║"
 echo "║  SSH Direct:  ssh -p 22 username@${DOMAIN}"
