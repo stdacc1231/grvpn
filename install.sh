@@ -1,9 +1,20 @@
 #!/bin/bash
-# GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.3 – FIXED
-# Robust installation – handles pip3 missing, qemu warnings, etc.
-# Run as root
+# ─────────────────────────────────────────────────────────────────────────────
+# GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.4
+# Let's Encrypt only – Single or Wildcard – Full Management
+# Secure VPN tunnel server – users cannot log in interactively.
+# Update via: git pull && bash install.sh (preserves data/config)
+# ─────────────────────────────────────────────────────────────────────────────
 
-set -e
+set -uo pipefail
+# NOTE: intentionally NOT using 'set -e' globally anymore. With 'set -e', one
+# missing apt package (e.g. a distro-specific name like stunnel5) could kill
+# the whole install silently, which is exactly what caused the reported
+# "pip3: command not found" bug — an earlier package in the same apt line
+# failed, but 2>/dev/null + set -e hid it, and the script marched on assuming
+# python3-pip had been installed when it hadn't. Every critical step below
+# now checks its own exit status, retries flaky network calls, and reports
+# failures loudly at the end instead of failing invisibly.
 
 # ─── Colours ────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -11,9 +22,10 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 NC='\033[0m'
 
-VERSION="4.0.3"
+VERSION="4.0.4"
 INSTALL_DIR="/opt/grvpn"
 DATA_DIR="${INSTALL_DIR}/data"
 CONFIG_DIR="${INSTALL_DIR}/config"
@@ -25,154 +37,297 @@ PANEL_SCRIPT="${BIN_DIR}/grvpn-panel.py"
 SYMLINK="/usr/local/bin/grvpn"
 WEBSOCAT_BIN="/usr/local/bin/websocat"
 
+mkdir -p /var/log/grvpn
+INSTALL_LOG="/var/log/grvpn/install.log"
+# Mirror everything to a persistent log so failures survive the "Press Enter" loop
+exec > >(tee -a "${INSTALL_LOG}") 2>&1
+
+FAILED_PACKAGES=()
+FAILED_STEPS=()
+
+# ─── Helper functions ───────────────────────────────────────────────────
+log_ok()   { echo -e "${GREEN}[✅] $*${NC}"; }
+log_info() { echo -e "${BLUE}[ℹ️] $*${NC}"; }
+log_warn() { echo -e "${YELLOW}[⚠️] $*${NC}"; }
+log_err()  { echo -e "${RED}[❌] $*${NC}"; }
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# Retry a flaky command (network installs, downloads) before giving up
+retry() {
+    local tries=3 delay=3 n=1
+    until "$@"; do
+        if (( n >= tries )); then
+            log_err "Failed after ${tries} attempts: $*"
+            return 1
+        fi
+        log_warn "Attempt ${n} failed: $*  — retrying in ${delay}s..."
+        n=$((n+1)); sleep "$delay"
+    done
+}
+
+# Install apt packages ONE AT A TIME so a single missing/renamed package
+# (e.g. stunnel5 vs stunnel4 depending on distro) can never silently take
+# the rest of the list down with it. Already-installed packages are skipped
+# instantly, which is what makes re-running this script for updates cheap.
+apt_install_each() {
+    local pkg
+    for pkg in "$@"; do
+        if dpkg -s "$pkg" >/dev/null 2>&1; then
+            continue
+        fi
+        log_info "Installing ${pkg}..."
+        if ! retry apt-get install -y -qq "$pkg"; then
+            FAILED_PACKAGES+=("$pkg")
+        fi
+    done
+}
+
+# Guarantees pip3 exists no matter what state the box is in. This directly
+# fixes the reported bug: python3-pip is now installed, verified, and
+# fallen back on through three layers before we give up.
+ensure_pip() {
+    if command_exists pip3; then
+        log_ok "pip3 already present."
+        return 0
+    fi
+    log_warn "pip3 not found — installing python3-pip."
+    retry apt-get install -y -qq python3-pip python3-venv || true
+    if command_exists pip3; then
+        log_ok "pip3 installed via apt."
+        return 0
+    fi
+    if command_exists python3; then
+        log_warn "apt install of python3-pip failed — trying 'python3 -m ensurepip'."
+        python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
+    fi
+    if command_exists pip3; then
+        log_ok "pip3 installed via ensurepip."
+        return 0
+    fi
+    log_warn "ensurepip failed — bootstrapping pip directly from PyPA (get-pip.py)."
+    if curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py 2>/dev/null; then
+        python3 /tmp/get-pip.py --quiet || true
+        rm -f /tmp/get-pip.py
+    fi
+    if command_exists pip3; then
+        log_ok "pip3 installed via get-pip.py."
+        return 0
+    fi
+    log_err "Could not install pip3 through any method. Python module install will be skipped — panel may not run until this is fixed manually."
+    FAILED_STEPS+=("pip3 bootstrap")
+    return 1
+}
+
+# Fetches the tag name of the latest GitHub release for a repo, e.g.
+# latest_github_release vi/websocat  ->  "v1.13.0"
+# Falls back to a pinned known-good version if the API call fails (rate
+# limits, no internet at install time, etc.) so the install never hard-stops.
+latest_github_release() {
+    local repo="$1" fallback="$2" tag
+    tag=$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+          | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')
+    if [[ -z "$tag" ]]; then
+        log_warn "Could not resolve latest release for ${repo} — using pinned fallback ${fallback}."
+        echo "$fallback"
+    else
+        echo "$tag"
+    fi
+}
+
 clear
 echo -e "${CYAN}"
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════════════════╗
-║  🐱 GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.3 – FIXED             ║
-║  Robust installer – no pip3 errors, no qemu warnings               ║
+║  🐱 GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.4                     ║
+║  Let's Encrypt – Single or Wildcard – Full Management              ║
+║  Secure VPN Tunnel – No interactive shell for users               ║
+║  Update via Git: pull and re‑run                                  ║
 ╚══════════════════════════════════════════════════════════════════════╝
 EOF
 echo -e "${NC}"
 
 # ─── Root check ─────────────────────────────────────────────────────────
 if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}[❌] Run as root.${NC}"
+    log_err "This script must be run as root."
     exit 1
 fi
 
-# ─── Domain & certificate type ─────────────────────────────────────────
-echo -e "${BLUE}[🌐] Domain setup${NC}"
-echo "Select certificate type:"
-echo "  1) Single domain (e.g., vpn.example.com) – HTTP-01 challenge"
-echo "  2) Wildcard domain (e.g., *.example.com) – DNS-01 challenge (requires API)"
-echo ""
-read -p "Enter choice [1/2]: " CERT_TYPE
-
-if [[ "$CERT_TYPE" != "1" && "$CERT_TYPE" != "2" ]]; then
-    echo -e "${RED}[❌] Invalid choice.${NC}"
-    exit 1
+# ─── Detect if this is a fresh install or an update ────────────────────
+IS_UPDATE=0
+if [[ -f "${DB_FILE}" ]]; then
+    IS_UPDATE=1
+    log_info "Existing installation detected — running in UPDATE mode (data/config preserved)."
 fi
 
-read -p "Enter domain (e.g., example.com or vpn.example.com): " DOMAIN
-if [[ -z "$DOMAIN" ]]; then
-    echo -e "${RED}[❌] Domain cannot be empty.${NC}"
-    exit 1
+# ─── Domain & certificate type (skip re-prompt on update if already set) ─
+EXISTING_DOMAIN=""
+if [[ "$IS_UPDATE" -eq 1 ]] && command_exists sqlite3; then
+    EXISTING_DOMAIN=$(sqlite3 "${DB_FILE}" "SELECT value FROM settings WHERE key='domain';" 2>/dev/null || true)
 fi
 
-if [[ "$CERT_TYPE" == "2" ]]; then
-    echo -e "${YELLOW}[ℹ️] Wildcard certificate requires DNS-01 challenge.${NC}"
-    echo "Supported providers: cloudflare, digitalocean, route53, etc."
-    read -p "Enter Cloudflare API token (or leave blank to use other plugin): " CF_API_TOKEN
-    if [[ -n "$CF_API_TOKEN" ]]; then
-        mkdir -p /root/.secrets
-        cat > /root/.secrets/cloudflare.ini <<EOF
+if [[ -n "$EXISTING_DOMAIN" ]]; then
+    log_info "Using existing domain: ${EXISTING_DOMAIN}"
+    DOMAIN="$EXISTING_DOMAIN"
+    CERT_TYPE="1"
+    CERTBOT_PLUGIN="--standalone --preferred-challenges http"
+else
+    echo -e "${BLUE}[🌐] Domain setup${NC}"
+    echo "Select certificate type:"
+    echo "  1) Single domain (e.g., vpn.example.com) – HTTP-01 challenge"
+    echo "  2) Wildcard domain (e.g., *.example.com) – DNS-01 challenge (requires API)"
+    echo ""
+    read -p "Enter choice [1/2]: " CERT_TYPE
+
+    if [[ "$CERT_TYPE" != "1" && "$CERT_TYPE" != "2" ]]; then
+        log_err "Invalid choice."
+        exit 1
+    fi
+
+    read -p "Enter domain (e.g., example.com or vpn.example.com): " DOMAIN
+    if [[ -z "$DOMAIN" ]]; then
+        log_err "Domain cannot be empty."
+        exit 1
+    fi
+
+    if [[ "$CERT_TYPE" == "2" ]]; then
+        log_warn "Wildcard certificate requires DNS-01 challenge."
+        echo "Supported providers: cloudflare, digitalocean, route53, etc."
+        echo "We'll install certbot-dns-cloudflare as default (you can adapt)."
+        read -p "Enter Cloudflare API token (or leave blank to use other plugin): " CF_API_TOKEN
+        if [[ -n "$CF_API_TOKEN" ]]; then
+            mkdir -p /root/.secrets
+            cat > /root/.secrets/cloudflare.ini <<EOF
 dns_cloudflare_api_token = $CF_API_TOKEN
 EOF
-        chmod 600 /root/.secrets/cloudflare.ini
-        CERTBOT_PLUGIN="--dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini"
+            chmod 600 /root/.secrets/cloudflare.ini
+            CERTBOT_PLUGIN="--dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini"
+        else
+            log_warn "No API token provided. You will need to manually install the appropriate certbot DNS plugin and adjust the command."
+            CERTBOT_PLUGIN="--manual --preferred-challenges dns"
+        fi
     else
-        CERTBOT_PLUGIN="--manual --preferred-challenges dns"
+        CERTBOT_PLUGIN="--standalone --preferred-challenges http"
     fi
-else
-    CERTBOT_PLUGIN="--standalone --preferred-challenges http"
 fi
 
 # ─── Directories ────────────────────────────────────────────────────────
-echo -e "${BLUE}[📁] Creating directory structure...${NC}"
+log_info "Creating directory structure..."
 mkdir -p "${INSTALL_DIR}" "${DATA_DIR}" "${CONFIG_DIR}" "${LOG_DIR}" "${BACKUP_DIR}" "${BIN_DIR}"
 mkdir -p /etc/grvpn /var/log/grvpn /etc/ssh/sshd_config.d
 mkdir -p /etc/stunnel5 /etc/stunnel /var/run/stunnel5
 chmod 755 /var/run/stunnel5
 
 # ─── Update system ──────────────────────────────────────────────────────
-echo -e "${BLUE}[🔄] Updating system...${NC}"
-apt update -qq && apt upgrade -y -qq 2>/dev/null || true
+log_info "Updating package index..."
+retry apt-get update -qq || log_warn "apt-get update reported issues — continuing with existing package cache."
+apt-get upgrade -y -qq || log_warn "apt-get upgrade reported issues — continuing."
 
-# ─── Install core packages ─────────────────────────────────────────────
-echo -e "${BLUE}[📦] Installing core packages...${NC}"
-# Suppress qemu/libvirt warnings by redirecting stderr
-apt install -y openssh-server nginx \
-    certbot python3-certbot-nginx python3-pip \
+# ─── Install packages (one at a time, self-healing) ────────────────────
+log_info "Installing core packages (missing ones only — safe to re-run)..."
+apt_install_each \
+    openssh-server nginx \
+    certbot python3-certbot-nginx python3-pip python3-venv \
     screen tmux ufw fail2ban redis-server \
     sqlite3 bc net-tools iptables-persistent \
     curl wget git unzip jq htop nload \
-    openssl netcat socat python3-bcrypt \
+    openssl netcat-openbsd socat python3-bcrypt \
     apache2-utils whois dnsutils uuid-runtime \
-    sshuttle python3-sshuttle iptables \
-    build-essential autoconf libtool pkg-config \
-    stunnel5 2>/dev/null || apt install -y stunnel4 2>/dev/null || true
+    sshuttle iptables \
+    build-essential autoconf libtool pkg-config
 
-# If stunnel4 installed, create symlink for stunnel5 compatibility
-if command -v stunnel4 &>/dev/null && ! command -v stunnel5 &>/dev/null; then
-    ln -sf /usr/bin/stunnel4 /usr/bin/stunnel5
-fi
-
-# Install certbot DNS plugin if wildcard and Cloudflare
-if [[ "$CERT_TYPE" == "2" && -n "$CF_API_TOKEN" ]]; then
-    apt install -y python3-certbot-dns-cloudflare 2>/dev/null || true
-fi
-
-# ─── Ensure pip3 is available ──────────────────────────────────────────
-echo -e "${BLUE}[🐍] Ensuring pip3 is installed...${NC}"
-if ! command -v pip3 &>/dev/null; then
-    echo -e "${YELLOW}[⚠️] pip3 not found, installing...${NC}"
-    apt install -y python3-pip 2>/dev/null || true
-    # If still missing, use python3 -m pip
-    if ! command -v pip3 &>/dev/null; then
-        echo -e "${YELLOW}[⚠️] pip3 still not available; using python3 -m pip${NC}"
-        alias pip3='python3 -m pip'
+# stunnel5 doesn't exist on all distros — try it, fall back to stunnel4,
+# and only report a real failure if BOTH are unavailable.
+if ! dpkg -s stunnel5 >/dev/null 2>&1 && ! dpkg -s stunnel4 >/dev/null 2>&1; then
+    log_info "Installing stunnel..."
+    if ! retry apt-get install -y -qq stunnel5; then
+        if ! retry apt-get install -y -qq stunnel4; then
+            FAILED_PACKAGES+=("stunnel5/stunnel4")
+        fi
     fi
 fi
-
-# ─── Python packages ────────────────────────────────────────────────────
-echo -e "${BLUE}[🐍] Installing Python modules...${NC}"
-# Use python3 -m pip if pip3 command is not found
-if command -v pip3 &>/dev/null; then
-    PIP_CMD="pip3"
-else
-    PIP_CMD="python3 -m pip"
+if command_exists stunnel4 && ! command_exists stunnel5; then
+    ln -sf "$(command -v stunnel4)" /usr/bin/stunnel5
+    log_ok "Linked stunnel4 -> stunnel5 for compatibility."
 fi
-$PIP_CMD install --upgrade psutil bcrypt cryptography pyOpenSSL sqlalchemy redis \
-    requests colorama prettytable tabulate python-dateutil --quiet 2>/dev/null || true
 
-# ─── websocat ───────────────────────────────────────────────────────────
-echo -e "${BLUE}[🌐] Installing websocat...${NC}"
-wget -q -O "${WEBSOCAT_BIN}" https://github.com/vi/websocat/releases/download/v1.12.0/websocat.x86_64-unknown-linux-musl
-chmod +x "${WEBSOCAT_BIN}"
+# Install certbot DNS plugin if wildcard + Cloudflare token was given
+if [[ "${CERT_TYPE:-}" == "2" && -n "${CF_API_TOKEN:-}" ]]; then
+    apt_install_each python3-certbot-dns-cloudflare
+fi
+
+if (( ${#FAILED_PACKAGES[@]} > 0 )); then
+    log_warn "The following packages could not be installed and may need manual attention: ${FAILED_PACKAGES[*]}"
+fi
+
+# ─── Python packages (this is the section that broke before) ───────────
+log_info "Setting up Python environment..."
+ensure_pip
+if command_exists pip3; then
+    log_info "Installing/upgrading Python modules (latest versions)..."
+    if ! retry pip3 install --upgrade --break-system-packages \
+        psutil bcrypt cryptography pyOpenSSL sqlalchemy redis \
+        requests colorama prettytable tabulate python-dateutil --quiet; then
+        # Older pip without --break-system-packages support (pre-PEP668) — retry without the flag
+        log_warn "pip3 install with --break-system-packages failed — retrying without it (older pip)."
+        retry pip3 install --upgrade \
+            psutil bcrypt cryptography pyOpenSSL sqlalchemy redis \
+            requests colorama prettytable tabulate python-dateutil --quiet \
+            || FAILED_STEPS+=("python module install")
+    fi
+else
+    FAILED_STEPS+=("python module install (no pip3)")
+fi
+
+# ─── websocat (always fetch the latest release, not a stale pin) ───────
+log_info "Installing websocat (latest release)..."
+WEBSOCAT_TAG=$(latest_github_release "vi/websocat" "v1.13.0")
+WEBSOCAT_URL="https://github.com/vi/websocat/releases/download/${WEBSOCAT_TAG}/websocat.x86_64-unknown-linux-musl"
+if retry wget -q -O "${WEBSOCAT_BIN}.tmp" "${WEBSOCAT_URL}"; then
+    mv "${WEBSOCAT_BIN}.tmp" "${WEBSOCAT_BIN}"
+    chmod +x "${WEBSOCAT_BIN}"
+    log_ok "websocat ${WEBSOCAT_TAG} installed."
+else
+    rm -f "${WEBSOCAT_BIN}.tmp"
+    log_err "websocat download failed — WebSocket tunneling will not work until this is fixed."
+    FAILED_STEPS+=("websocat download")
+fi
 
 # ─── SSL certificate (Let's Encrypt only) ─────────────────────────────
-echo -e "${BLUE}[🔐] Obtaining Let's Encrypt certificate for ${DOMAIN}...${NC}"
+log_info "Obtaining/verifying Let's Encrypt certificate for ${DOMAIN}..."
 systemctl stop nginx 2>/dev/null || true
-
-CERTBOT_CMD="certbot certonly ${CERTBOT_PLUGIN} -d ${DOMAIN} --non-interactive --agree-tos -m admin@${DOMAIN} --keep-until-expiring"
-
-if [[ "$CERT_TYPE" == "2" ]]; then
-    CERTBOT_CMD="certbot certonly ${CERTBOT_PLUGIN} -d ${DOMAIN} -d *.${DOMAIN} --non-interactive --agree-tos -m admin@${DOMAIN} --keep-until-expiring"
-fi
-
-if ! eval "$CERTBOT_CMD" 2>/dev/null; then
-    echo -e "${RED}[❌] Let's Encrypt certificate issuance failed.${NC}"
-    echo -e "${RED}Please check your domain DNS and try again.${NC}"
-    echo -e "${RED}No self‑signed fallback is provided. Exiting.${NC}"
-    exit 1
-fi
 
 CERT_PATH="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
 KEY_PATH="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
+
+if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
+    log_ok "Existing certificate for ${DOMAIN} found — skipping re-issuance (use Domain Manager > Renew to refresh)."
+else
+    CERTBOT_CMD="certbot certonly ${CERTBOT_PLUGIN} -d ${DOMAIN} --non-interactive --agree-tos -m admin@${DOMAIN} --keep-until-expiring"
+    if [[ "$CERT_TYPE" == "2" ]]; then
+        CERTBOT_CMD="certbot certonly ${CERTBOT_PLUGIN} -d ${DOMAIN} -d *.${DOMAIN} --non-interactive --agree-tos -m admin@${DOMAIN} --keep-until-expiring"
+    fi
+    if ! eval "$CERTBOT_CMD"; then
+        log_err "Let's Encrypt certificate issuance failed."
+        log_err "Check your domain's DNS points at this server and try again."
+        log_err "No self-signed fallback is provided. Exiting."
+        exit 1
+    fi
+fi
+
 if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
     cp "$CERT_PATH" /etc/ssl/grvpn.pem
     cp "$KEY_PATH" /etc/ssl/grvpn.key
     chmod 600 /etc/ssl/grvpn.key
     chmod 644 /etc/ssl/grvpn.pem
-    echo -e "${GREEN}[✅] Certificate installed successfully.${NC}"
+    log_ok "Certificate installed."
 else
-    echo -e "${RED}[❌] Certificate files not found. Exiting.${NC}"
+    log_err "Certificate files not found. Exiting."
     exit 1
 fi
 
-# ─── SSH Hardening ──────────────────────────────────────────────────────
-echo -e "${BLUE}[🔒] Configuring SSH (secure defaults)...${NC}"
+# ─── SSH Hardening (defaults, no menu) ────────────────────────────────
+log_info "Configuring SSH (secure defaults)..."
 cat > /etc/ssh/sshd_config << 'EOF'
 # GRVPN Enterprise SSH Configuration – Secure by default
 Port 22
@@ -210,6 +365,7 @@ Compression yes
 MaxSessions 1000
 MaxStartups 500:30:1000
 LoginGraceTime 30
+MaxAuthTries 4
 
 PermitTunnel yes
 AllowTcpForwarding yes
@@ -227,8 +383,15 @@ EOF
 mkdir -p /etc/ssh/sshd_config.d
 ssh-keygen -A
 
-# ─── Nginx Configuration ──────────────────────────────────────────────
-echo -e "${BLUE}[🔧] Configuring Nginx...${NC}"
+if sshd -t 2>/dev/null; then
+    log_ok "sshd config validated."
+else
+    log_err "sshd config failed validation! Not restarting SSH — fix /etc/ssh/sshd_config manually before continuing."
+    FAILED_STEPS+=("sshd config validation")
+fi
+
+# ─── Nginx Configuration (fixed root "/" for WS) ──────────────────────
+log_info "Configuring Nginx..."
 cat > /etc/nginx/sites-available/grvpn << EOF
 server {
     listen 80;
@@ -286,13 +449,20 @@ EOF
 ln -sf /etc/nginx/sites-available/grvpn /etc/nginx/sites-enabled/
 rm -f /etc/nginx/sites-enabled/default
 
+if nginx -t 2>/dev/null; then
+    log_ok "nginx config validated."
+else
+    log_err "nginx config failed validation! Check /etc/nginx/sites-available/grvpn manually."
+    FAILED_STEPS+=("nginx config validation")
+fi
+
 # ─── Stunnel5 Configuration ─────────────────────────────────────────────
-echo -e "${BLUE}[🔧] Configuring Stunnel5...${NC}"
+log_info "Configuring Stunnel..."
 mkdir -p /etc/stunnel5 /var/run/stunnel5
 chmod 755 /var/run/stunnel5
 
 cat > /etc/stunnel5/stunnel.conf << 'STUNNEL_EOF'
-; GRVPN Enterprise Stunnel5 Configuration
+; GRVPN Enterprise Stunnel Configuration
 pid = /var/run/stunnel5.pid
 debug = 3
 output = /var/log/stunnel5.log
@@ -360,7 +530,7 @@ TIMEOUTclose = 0
 STUNNEL_EOF
 
 # ─── Fail2ban ──────────────────────────────────────────────────────────
-echo -e "${BLUE}[🛡️] Configuring Fail2ban...${NC}"
+log_info "Configuring Fail2ban..."
 cat > /etc/fail2ban/jail.local << 'FAIL2BAN_EOF'
 [DEFAULT]
 bantime = 3600
@@ -386,15 +556,16 @@ bantime = 7200
 FAIL2BAN_EOF
 
 # ─── Firewall (UFW) ────────────────────────────────────────────────────
-echo -e "${BLUE}[🔥] Configuring UFW firewall...${NC}"
+log_info "Configuring UFW firewall..."
 for port in 22 80 443 8443 2052 2053 2082 2083 2086 2087 2095 2096 8880 8080; do
     ufw allow "$port"/tcp 2>/dev/null || true
 done
 ufw --force enable 2>/dev/null || true
 
-# ─── Kernel tuning ──────────────────────────────────────────────────────
-echo -e "${BLUE}[⚡] Optimising kernel parameters...${NC}"
-cat >> /etc/sysctl.conf << 'KERNEL_EOF'
+# ─── Kernel tuning (idempotent — won't duplicate on re-run/update) ─────
+log_info "Optimising kernel parameters..."
+if ! grep -q "# GRVPN Kernel Optimization" /etc/sysctl.conf 2>/dev/null; then
+    cat >> /etc/sysctl.conf << 'KERNEL_EOF'
 # GRVPN Kernel Optimization
 net.core.rmem_max = 134217728
 net.core.wmem_max = 134217728
@@ -421,12 +592,15 @@ fs.file-max = 2097152
 vm.swappiness = 10
 vm.vfs_cache_pressure = 50
 KERNEL_EOF
-
+else
+    log_info "Kernel tuning already applied — skipping duplicate append."
+fi
 sysctl -p 2>/dev/null || true
 
-# ─── File limits ────────────────────────────────────────────────────────
-echo -e "${BLUE}[📊] Setting file limits...${NC}"
-cat >> /etc/security/limits.conf << 'LIMITS_EOF'
+# ─── File limits (idempotent) ───────────────────────────────────────────
+log_info "Setting file limits..."
+if ! grep -q "# GRVPN Limits" /etc/security/limits.conf 2>/dev/null; then
+    cat >> /etc/security/limits.conf << 'LIMITS_EOF'
 # GRVPN Limits
 * soft nofile 2097152
 * hard nofile 2097152
@@ -437,9 +611,12 @@ root hard nofile 2097152
 root soft nproc 2097152
 root hard nproc 2097152
 LIMITS_EOF
+else
+    log_info "File limits already applied — skipping duplicate append."
+fi
 
 # ─── Database ───────────────────────────────────────────────────────────
-echo -e "${BLUE}[💾] Creating database...${NC}"
+log_info "Setting up database (existing data preserved if present)..."
 mkdir -p "${DATA_DIR}"
 sqlite3 "${DB_FILE}" << 'SQL_EOF'
 CREATE TABLE IF NOT EXISTS users (
@@ -531,7 +708,7 @@ CREATE TABLE IF NOT EXISTS backups (
 INSERT OR IGNORE INTO settings (key, value) VALUES
     ('domain', 'DOMAIN_PLACEHOLDER'),
     ('server_name', 'GRVPN Enterprise Server'),
-    ('version', '4.0.3'),
+    ('version', '4.0.4'),
     ('trial_duration', '30'),
     ('default_data_limit', '0'),
     ('default_download_speed', '0'),
@@ -541,44 +718,65 @@ INSERT OR IGNORE INTO settings (key, value) VALUES
 SQL_EOF
 
 sqlite3 "${DB_FILE}" "UPDATE settings SET value='$DOMAIN' WHERE key='domain';"
+sqlite3 "${DB_FILE}" "UPDATE settings SET value='${VERSION}' WHERE key='version';"
 
-# ─── Admin user ─────────────────────────────────────────────────────────
-echo -e "${BLUE}[👤] Creating admin user...${NC}"
+# ─── Admin user (only created once — never overwrites an existing admin) ─
+log_info "Ensuring admin user exists..."
+if command_exists python3; then
 python3 << PYTHON_ADMIN
-import sqlite3, bcrypt
+import sqlite3, secrets, string
 DB = '/opt/grvpn/data/grvpn.db'
 conn = sqlite3.connect(DB)
 c = conn.cursor()
 c.execute("SELECT * FROM users WHERE username='grvpn'")
 if not c.fetchone():
-    pwd = bcrypt.hashpw(b'GRVPN@2026', bcrypt.gensalt())
-    c.execute("INSERT INTO users(username, password, is_admin, is_active, ssh_port, ws_port) VALUES('grvpn', ?, 1, 1, 2000, 3000)", (pwd,))
-    conn.commit()
+    try:
+        import bcrypt
+        alphabet = string.ascii_letters + string.digits
+        pwd_plain = ''.join(secrets.choice(alphabet) for _ in range(16))
+        pwd = bcrypt.hashpw(pwd_plain.encode(), bcrypt.gensalt())
+        c.execute("INSERT INTO users(username, password, is_admin, is_active, ssh_port, ws_port) VALUES('grvpn', ?, 1, 1, 2000, 3000)", (pwd,))
+        conn.commit()
+        with open('/opt/grvpn/data/.admin_credentials', 'w') as f:
+            f.write(f"username: grvpn\npassword: {pwd_plain}\n")
+        import os
+        os.chmod('/opt/grvpn/data/.admin_credentials', 0o600)
+        print(f"[OK] Admin user created. Credentials saved to /opt/grvpn/data/.admin_credentials (root-only, chmod 600).")
+    except ImportError:
+        print("[WARN] bcrypt module missing — admin user NOT created. Re-run this script after fixing the Python module install.")
+else:
+    print("[INFO] Admin user already exists — leaving password untouched.")
 conn.close()
-print("[✅] Admin user created: grvpn / GRVPN@2026")
 PYTHON_ADMIN
+else
+    log_err "python3 not available — cannot create admin user."
+    FAILED_STEPS+=("admin user creation")
+fi
 
 # ─── Panel script ──────────────────────────────────────────────────────
-echo -e "${BLUE}[📝] Creating GRVPN Enterprise Panel...${NC}"
+log_info "Deploying GRVPN Enterprise Panel..."
 cat > "${PANEL_SCRIPT}" << 'PANEL_EOF'
 #!/usr/bin/env python3
 """
-GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.3
+GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.4
 Full-featured CLI management panel
 """
-import os, sys, sqlite3, subprocess, time, json, psutil, bcrypt, uuid
+import os, sys, sqlite3, subprocess, time, json, uuid
 from datetime import datetime, timedelta
+
 try:
+    import psutil, bcrypt
     from prettytable import PrettyTable
-except ImportError:
-    os.system('python3 -m pip install prettytable --quiet')
-    from prettytable import PrettyTable
-import colorama
-colorama.init()
+    import colorama
+    colorama.init()
+except ImportError as e:
+    print(f"[❌] Missing Python module: {e.name}")
+    print("Run: pip3 install --break-system-packages psutil bcrypt prettytable colorama")
+    sys.exit(1)
 
 INSTALL_DIR = '/opt/grvpn'
 DB = f'{INSTALL_DIR}/data/grvpn.db'
-VERSION = '4.0.3'
+VERSION = '4.0.4'
 
 def get_conn():
     return sqlite3.connect(DB)
@@ -602,7 +800,7 @@ def get_all_users():
     conn = get_conn()
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute('''SELECT u.*,
+    c.execute('''SELECT u.*, 
         (SELECT COUNT(*) FROM sessions WHERE user_id=u.id AND is_active=1) as active_sessions
         FROM users u WHERE is_active=1''')
     users = [dict(row) for row in c.fetchall()]
@@ -670,6 +868,14 @@ def set_setting(key, value):
     c.execute("REPLACE INTO settings(key, value) VALUES(?,?)", (key, str(value)))
     conn.commit()
     conn.close()
+
+def run(cmd, **kwargs):
+    """subprocess.run wrapper that never raises — always returns a CompletedProcess-like result."""
+    try:
+        return subprocess.run(cmd, **kwargs)
+    except FileNotFoundError:
+        print(f"[❌] Command not found: {cmd[0] if isinstance(cmd, list) else cmd}")
+        return subprocess.CompletedProcess(cmd, 127)
 
 # ================== MAIN MENU ==================
 def main_menu():
@@ -833,7 +1039,7 @@ def create_user():
         f.write("    PermitEmptyPasswords no\n")
         f.write("    ClientAliveInterval 60\n")
         f.write("    TCPKeepAlive yes\n")
-    subprocess.run(['systemctl', 'reload', 'ssh'], check=False)
+    run(['systemctl', 'reload', 'ssh'], check=False)
     log_activity(user_id, 'user_created', details=f'Data:{data_limit}GB DL:{dl_speed} UL:{ul_speed} IP:{ip_limit}')
     print(f"\n[✅] User created: {username}")
     print(f"    SSH Port: {ssh_port}")
@@ -879,7 +1085,7 @@ def create_trial():
         f.write("    PermitEmptyPasswords no\n")
         f.write("    ClientAliveInterval 60\n")
         f.write("    TCPKeepAlive yes\n")
-    subprocess.run(['systemctl', 'reload', 'ssh'], check=False)
+    run(['systemctl', 'reload', 'ssh'], check=False)
     log_activity(user_id, 'trial_created', details=f'Duration:{minutes}min')
     print(f"\n[✅] Trial user created!")
     print(f"    Username: {username}")
@@ -898,8 +1104,13 @@ def edit_user():
         input("Press Enter...")
         return
     print(f"\n✏️ EDIT USER: {username}")
-    print("Available fields: email, data_limit, download_speed, upload_speed, ip_limit, is_active, notes, expires_at (YYYY-MM-DD HH:MM:SS)")
+    allowed_fields = {'email','data_limit','download_speed','upload_speed','ip_limit','is_active','notes','expires_at'}
+    print(f"Available fields: {', '.join(sorted(allowed_fields))} (expires_at format: YYYY-MM-DD HH:MM:SS)")
     field = input("Field: ").strip()
+    if field not in allowed_fields:
+        print("[❌] Invalid/disallowed field.")
+        input("Press Enter...")
+        return
     value = input("Value: ").strip()
     if field in ['data_limit', 'download_speed', 'upload_speed', 'ip_limit']:
         value = int(value) if value else 0
@@ -908,13 +1119,13 @@ def edit_user():
     elif field == 'expires_at':
         try:
             datetime.fromisoformat(value)
-        except:
+        except ValueError:
             print("[❌] Invalid date format. Use YYYY-MM-DD HH:MM:SS")
             input("Press Enter...")
             return
     conn = get_conn()
     c = conn.cursor()
-    c.execute(f"UPDATE users SET {field}=? WHERE id=?", (value, user['id']))
+    c.execute(f"UPDATE users SET {field}=? WHERE id=?", (value, user['id']))  # field is whitelisted above
     conn.commit()
     conn.close()
     log_activity(user['id'], 'user_updated', details=f'{field}={value}')
@@ -938,11 +1149,10 @@ def delete_user():
     c.execute("DELETE FROM users WHERE id=?", (user['id'],))
     conn.commit()
     conn.close()
-    try:
-        os.remove(f'/etc/ssh/sshd_config.d/{username}.conf')
-        subprocess.run(['systemctl', 'reload', 'ssh'], check=False)
-    except:
-        pass
+    conf_file = f'/etc/ssh/sshd_config.d/{username}.conf'
+    if os.path.exists(conf_file):
+        os.remove(conf_file)
+        run(['systemctl', 'reload', 'ssh'], check=False)
     print(f"[🗑️] User {username} deleted!")
     input("Press Enter...")
 
@@ -1077,7 +1287,7 @@ def disconnect_all():
 def backup_users():
     clear_screen()
     backup_path = f"/opt/grvpn/backups/users_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-    subprocess.run(f"cp {DB} {backup_path}", shell=True)
+    run(['cp', DB, backup_path], check=False)
     print(f"[✅] Users backed up: {backup_path}")
     input("Press Enter...")
 
@@ -1090,8 +1300,8 @@ def restore_users():
         return
     if input("Restore users? (y/n): ").strip().lower() != 'y':
         return
-    subprocess.run(f"cp {backup} {DB}", shell=True)
-    subprocess.run(['systemctl', 'reload', 'ssh'], check=False)
+    run(['cp', backup, DB], check=False)
+    run(['systemctl', 'reload', 'ssh'], check=False)
     print("[✅] Users restored!")
     input("Press Enter...")
 
@@ -1157,8 +1367,8 @@ def set_domain():
     c.execute("UPDATE settings SET value=? WHERE key='domain'", (domain,))
     conn.commit()
     conn.close()
-    subprocess.run(f"sed -i 's/server_name .*/server_name {domain};/g' /etc/nginx/sites-available/grvpn", shell=True)
-    subprocess.run(['systemctl', 'reload', 'nginx'], check=False)
+    run(f"sed -i 's/server_name .*/server_name {domain};/g' /etc/nginx/sites-available/grvpn", shell=True, check=False)
+    run(['systemctl', 'reload', 'nginx'], check=False)
     print(f"[✅] Domain set to: {domain}")
     input("Press Enter...")
 
@@ -1172,43 +1382,43 @@ def replace_domain():
         input("Press Enter...")
         return
     print("[🔐] Obtaining new certificate...")
-    subprocess.run(['systemctl', 'stop', 'nginx'], check=False)
+    run(['systemctl', 'stop', 'nginx'], check=False)
     cmd = f"certbot certonly --standalone -d {new} --non-interactive --agree-tos -m admin@{new}"
-    if subprocess.run(cmd, shell=True).returncode == 0:
-        subprocess.run(f"cp /etc/letsencrypt/live/{new}/fullchain.pem /etc/ssl/grvpn.pem", shell=True)
-        subprocess.run(f"cp /etc/letsencrypt/live/{new}/privkey.pem /etc/ssl/grvpn.key", shell=True)
+    if run(cmd, shell=True, check=False).returncode == 0:
+        run(f"cp /etc/letsencrypt/live/{new}/fullchain.pem /etc/ssl/grvpn.pem", shell=True, check=False)
+        run(f"cp /etc/letsencrypt/live/{new}/privkey.pem /etc/ssl/grvpn.key", shell=True, check=False)
         conn = get_conn()
         c = conn.cursor()
         c.execute("UPDATE settings SET value=? WHERE key='domain'", (new,))
         conn.commit()
         conn.close()
-        subprocess.run(f"sed -i 's/server_name .*/server_name {new};/g' /etc/nginx/sites-available/grvpn", shell=True)
-        subprocess.run(['systemctl', 'reload', 'nginx'], check=False)
+        run(f"sed -i 's/server_name .*/server_name {new};/g' /etc/nginx/sites-available/grvpn", shell=True, check=False)
+        run(['systemctl', 'reload', 'nginx'], check=False)
         print(f"[✅] Domain replaced: {old} -> {new}")
     else:
         print("[❌] Certificate issuance failed.")
-        subprocess.run(['systemctl', 'start', 'nginx'], check=False)
+        run(['systemctl', 'start', 'nginx'], check=False)
     input("Press Enter...")
 
 def regenerate_cert():
     clear_screen()
     domain = get_domain()
     print(f"[🔐] Regenerating certificate for {domain}...")
-    subprocess.run(['systemctl', 'stop', 'nginx'], check=False)
+    run(['systemctl', 'stop', 'nginx'], check=False)
     cmd = f"certbot certonly --standalone -d {domain} --non-interactive --agree-tos -m admin@{domain}"
-    if subprocess.run(cmd, shell=True).returncode == 0:
-        subprocess.run(f"cp /etc/letsencrypt/live/{domain}/fullchain.pem /etc/ssl/grvpn.pem", shell=True)
-        subprocess.run(f"cp /etc/letsencrypt/live/{domain}/privkey.pem /etc/ssl/grvpn.key", shell=True)
+    if run(cmd, shell=True, check=False).returncode == 0:
+        run(f"cp /etc/letsencrypt/live/{domain}/fullchain.pem /etc/ssl/grvpn.pem", shell=True, check=False)
+        run(f"cp /etc/letsencrypt/live/{domain}/privkey.pem /etc/ssl/grvpn.key", shell=True, check=False)
         print("[✅] Certificate regenerated!")
     else:
         print("[❌] Regeneration failed.")
-    subprocess.run(['systemctl', 'start', 'nginx'], check=False)
+    run(['systemctl', 'start', 'nginx'], check=False)
     input("Press Enter...")
 
 def renew_cert():
     clear_screen()
     print("[🔄] Renewing certificates...")
-    subprocess.run(['certbot', 'renew', '--nginx', '--non-interactive'], check=False)
+    run(['certbot', 'renew', '--nginx', '--non-interactive'], check=False)
     print("[✅] Renewal attempted. Check logs if failed.")
     input("Press Enter...")
 
@@ -1219,7 +1429,7 @@ def install_custom_cert():
         print("[❌] Certificate not found!")
         input("Press Enter...")
         return
-    subprocess.run(f"cp {cert_path} /etc/ssl/grvpn.pem", shell=True)
+    run(['cp', cert_path, '/etc/ssl/grvpn.pem'], check=False)
     print("[✅] Certificate installed!")
     input("Press Enter...")
 
@@ -1230,14 +1440,14 @@ def install_custom_key():
         print("[❌] Private key not found!")
         input("Press Enter...")
         return
-    subprocess.run(f"cp {key_path} /etc/ssl/grvpn.key", shell=True)
-    subprocess.run(['chmod', '600', '/etc/ssl/grvpn.key'], check=False)
+    run(['cp', key_path, '/etc/ssl/grvpn.key'], check=False)
+    run(['chmod', '600', '/etc/ssl/grvpn.key'], check=False)
     print("[✅] Private key installed!")
     input("Press Enter...")
 
 def validate_cert():
     clear_screen()
-    result = subprocess.run(['openssl', 'verify', '-CAfile', '/etc/ssl/grvpn.pem', '/etc/ssl/grvpn.pem'], capture_output=True)
+    result = run(['openssl', 'verify', '-CAfile', '/etc/ssl/grvpn.pem', '/etc/ssl/grvpn.pem'], capture_output=True, check=False)
     if result.returncode == 0:
         print("[✅] Certificate is valid!")
     else:
@@ -1246,14 +1456,14 @@ def validate_cert():
 
 def cert_expiry():
     clear_screen()
-    result = subprocess.run(['openssl', 'x509', '-in', '/etc/ssl/grvpn.pem', '-noout', '-enddate'], capture_output=True)
-    print(f"\n📅 {result.stdout.decode().strip()}")
+    result = run(['openssl', 'x509', '-in', '/etc/ssl/grvpn.pem', '-noout', '-enddate'], capture_output=True, check=False)
+    print(f"\n📅 {result.stdout.decode().strip() if result.stdout else 'unavailable'}")
     input("\nPress Enter...")
 
 def restart_services():
     clear_screen()
     for svc in ['nginx', 'ssh', 'stunnel5']:
-        subprocess.run(['systemctl', 'restart', svc], check=False)
+        run(['systemctl', 'restart', svc], check=False)
         print(f"[✅] {svc} restarted!")
     input("Press Enter...")
 
@@ -1283,12 +1493,12 @@ def tls_manager():
 
 def cert_details():
     clear_screen()
-    subprocess.run(['openssl', 'x509', '-in', '/etc/ssl/grvpn.pem', '-noout', '-text'], check=False)
+    run(['openssl', 'x509', '-in', '/etc/ssl/grvpn.pem', '-noout', '-text'], check=False)
     input("\nPress Enter...")
 
 def restart_tls():
     for svc in ['nginx', 'stunnel5']:
-        subprocess.run(['systemctl', 'restart', svc], check=False)
+        run(['systemctl', 'restart', svc], check=False)
         print(f"[✅] {svc} restarted!")
     input("Press Enter...")
 
@@ -1317,28 +1527,28 @@ def nginx_manager():
         elif choice == '6': break
 
 def reload_nginx():
-    subprocess.run(['systemctl', 'reload', 'nginx'], check=False)
+    run(['systemctl', 'reload', 'nginx'], check=False)
     print("[✅] Nginx reloaded!")
     input("Press Enter...")
 
 def restart_nginx():
-    subprocess.run(['systemctl', 'restart', 'nginx'], check=False)
+    run(['systemctl', 'restart', 'nginx'], check=False)
     print("[✅] Nginx restarted!")
     input("Press Enter...")
 
 def validate_nginx():
-    subprocess.run(['nginx', '-t'], check=False)
+    run(['nginx', '-t'], check=False)
     input("\nPress Enter...")
 
 def view_nginx_logs():
     clear_screen()
     lines = input("Lines (default 50): ").strip() or "50"
-    subprocess.run(['tail', f'-{lines}', '/var/log/nginx/error.log'], check=False)
+    run(['tail', f'-{lines}', '/var/log/nginx/error.log'], check=False)
     input("\nPress Enter...")
 
 def show_nginx_config():
     clear_screen()
-    subprocess.run(['cat', '/etc/nginx/sites-available/grvpn'], check=False)
+    run(['cat', '/etc/nginx/sites-available/grvpn'], check=False)
     input("\nPress Enter...")
 
 # ================== BANNER MANAGER ==================
@@ -1365,7 +1575,7 @@ def banner_manager():
 
 def set_global_banner():
     clear_screen()
-    print("Enter banner (use \\n for new lines, press Ctrl+D when done):")
+    print("Enter banner (press Ctrl+D when done):")
     lines = []
     try:
         while True:
@@ -1373,7 +1583,7 @@ def set_global_banner():
             lines.append(line)
     except EOFError:
         pass
-    banner = '\\n'.join(lines)
+    banner = '\n'.join(lines)
     conn = get_conn()
     c = conn.cursor()
     c.execute("REPLACE INTO settings(key, value) VALUES('global_banner', ?)", (banner,))
@@ -1390,14 +1600,9 @@ def set_user_banner():
         print("[❌] User not found!")
         input("Press Enter...")
         return
-    print("Enter banner (use \\n for new lines):")
     banner = input("Banner: ").strip()
     conn = get_conn()
     c = conn.cursor()
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN ssh_banner TEXT")
-    except:
-        pass
     c.execute("UPDATE users SET ssh_banner=? WHERE id=?", (banner, user['id']))
     conn.commit()
     conn.close()
@@ -1567,13 +1772,13 @@ def server_dashboard():
 ║  📈 SERVER DASHBOARD                                               ║
 ╠══════════════════════════════════════════════════════════════════════╣
 """)
-    print(f"║  🖥️  CPU           : {cpu}%                                                      ║")
-    print(f"║  💾 Memory       : {mem.used/1024**3:.2f}GB / {mem.total/1024**3:.2f}GB ({mem.percent}%)              ║")
-    print(f"║  💿 Disk         : {disk.used/1024**3:.2f}GB / {disk.total/1024**3:.2f}GB ({disk.percent}%)              ║")
-    print(f"║  🌐 Network      : Sent {net.bytes_sent/1024**3:.2f}GB | Received {net.bytes_recv/1024**3:.2f}GB    ║")
+    print(f"║  🖥️  CPU           : {cpu}%")
+    print(f"║  💾 Memory       : {mem.used/1024**3:.2f}GB / {mem.total/1024**3:.2f}GB ({mem.percent}%)")
+    print(f"║  💿 Disk         : {disk.used/1024**3:.2f}GB / {disk.total/1024**3:.2f}GB ({disk.percent}%)")
+    print(f"║  🌐 Network      : Sent {net.bytes_sent/1024**3:.2f}GB | Received {net.bytes_recv/1024**3:.2f}GB")
     print("╠══════════════════════════════════════════════════════════════════════╣")
-    print(f"║  👥 Users        : {total_users} Total                                           ║")
-    print(f"║  🔌 Sessions     : {active_sessions} Active                                       ║")
+    print(f"║  👥 Users        : {total_users} Total")
+    print(f"║  🔌 Sessions     : {active_sessions} Active")
     print("╚══════════════════════════════════════════════════════════════════════╝")
     input("\nPress Enter...")
 
@@ -1608,12 +1813,12 @@ def full_backup():
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     path = f"/opt/grvpn/backups/full_backup_{ts}"
     os.makedirs(path, exist_ok=True)
-    subprocess.run(f"cp -r /opt/grvpn/data {path}/", shell=True)
-    subprocess.run(f"cp -r /etc/nginx/sites-available {path}/", shell=True)
-    subprocess.run(f"cp -r /etc/stunnel5 {path}/", shell=True)
-    subprocess.run(f"cp -r /etc/ssh/sshd_config.d {path}/", shell=True)
-    subprocess.run(f"cp /etc/ssl/grvpn.pem {path}/", shell=True)
-    subprocess.run(f"cp /etc/ssl/grvpn.key {path}/", shell=True)
+    run(f"cp -r /opt/grvpn/data {path}/", shell=True, check=False)
+    run(f"cp -r /etc/nginx/sites-available {path}/", shell=True, check=False)
+    run(f"cp -r /etc/stunnel5 {path}/", shell=True, check=False)
+    run(f"cp -r /etc/ssh/sshd_config.d {path}/", shell=True, check=False)
+    run(f"cp /etc/ssl/grvpn.pem {path}/", shell=True, check=False)
+    run(f"cp /etc/ssl/grvpn.key {path}/", shell=True, check=False)
     print(f"[✅] Full backup created: {path}")
     input("Press Enter...")
 
@@ -1621,7 +1826,7 @@ def user_backup():
     clear_screen()
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     path = f"/opt/grvpn/backups/users_{ts}.db"
-    subprocess.run(f"cp {DB} {path}", shell=True)
+    run(['cp', DB, path], check=False)
     print(f"[✅] Users backed up: {path}")
     input("Press Enter...")
 
@@ -1629,13 +1834,13 @@ def config_backup():
     clear_screen()
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     path = f"/opt/grvpn/backups/config_{ts}.tar.gz"
-    subprocess.run(f"tar -czf {path} /etc/nginx/sites-available /etc/stunnel5 /etc/ssh/sshd_config.d", shell=True)
+    run(f"tar -czf {path} /etc/nginx/sites-available /etc/stunnel5 /etc/ssh/sshd_config.d", shell=True, check=False)
     print(f"[✅] Config backed up: {path}")
     input("Press Enter...")
 
 def list_backups():
     clear_screen()
-    subprocess.run("ls -lh /opt/grvpn/backups/", shell=True)
+    run("ls -lh /opt/grvpn/backups/", shell=True, check=False)
     input("\nPress Enter...")
 
 def restore_backup():
@@ -1648,24 +1853,26 @@ def restore_backup():
     if input("Restore will overwrite current data! Continue? (y/n): ").strip().lower() != 'y':
         return
     if os.path.isdir(backup):
-        subprocess.run(f"cp -r {backup}/data/* /opt/grvpn/data/", shell=True)
-        subprocess.run(f"cp -r {backup}/nginx/* /etc/nginx/", shell=True)
-        subprocess.run(f"cp -r {backup}/stunnel5/* /etc/stunnel5/", shell=True)
-        subprocess.run(f"cp -r {backup}/sshd_config.d/* /etc/ssh/sshd_config.d/", shell=True)
+        run(f"cp -r {backup}/data/* /opt/grvpn/data/", shell=True, check=False)
+        run(f"cp -r {backup}/sites-available/* /etc/nginx/sites-available/", shell=True, check=False)
+        run(f"cp -r {backup}/stunnel5/* /etc/stunnel5/", shell=True, check=False)
+        run(f"cp -r {backup}/sshd_config.d/* /etc/ssh/sshd_config.d/", shell=True, check=False)
         if os.path.exists(f"{backup}/grvpn.pem"):
-            subprocess.run(f"cp {backup}/grvpn.pem /etc/ssl/grvpn.pem", shell=True)
-            subprocess.run(f"cp {backup}/grvpn.key /etc/ssl/grvpn.key", shell=True)
+            run(f"cp {backup}/grvpn.pem /etc/ssl/grvpn.pem", shell=True, check=False)
+            run(f"cp {backup}/grvpn.key /etc/ssl/grvpn.key", shell=True, check=False)
     else:
-        subprocess.run(f"cp {backup} /opt/grvpn/data/grvpn.db", shell=True)
-    subprocess.run(['systemctl', 'reload', 'nginx', 'ssh', 'stunnel5'], check=False)
+        run(f"cp {backup} /opt/grvpn/data/grvpn.db", shell=True, check=False)
+    run(['systemctl', 'reload', 'nginx'], check=False)
+    run(['systemctl', 'reload', 'ssh'], check=False)
+    run(['systemctl', 'restart', 'stunnel5'], check=False)
     print("[✅] Restored!")
     input("Press Enter...")
 
 def clean_backups():
     clear_screen()
     days = int(input("Keep backups from last N days (default 30): ").strip() or "30")
-    subprocess.run(f"find /opt/grvpn/backups -type f -mtime +{days} -delete", shell=True)
-    subprocess.run(f"find /opt/grvpn/backups -type d -mtime +{days} -exec rm -rf {{}} + 2>/dev/null", shell=True)
+    run(f"find /opt/grvpn/backups -type f -mtime +{days} -delete", shell=True, check=False)
+    run(f"find /opt/grvpn/backups -type d -empty -mtime +{days} -delete", shell=True, check=False)
     print(f"[✅] Cleaned backups older than {days} days.")
     input("Press Enter...")
 
@@ -1678,10 +1885,10 @@ def update_manager():
 ║  🔄 UPDATE MANAGER                                                 ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  1.  Check for Updates                                              ║
-║  2.  Update Application (pull from Git)                             ║
-║  3.  Update Dependencies                                            ║
+║  2.  Update Application (pull from Git + re-run installer)          ║
+║  3.  Update Dependencies (apt + pip, latest versions)                ║
 ║  4.  Restart Services After Update                                 ║
-║  5.  View Update Log                                                ║
+║  5.  View Update/Install Log                                        ║
 ║  6.  Back to Main                                                   ║
 ╚══════════════════════════════════════════════════════════════════════╝
         """)
@@ -1696,44 +1903,53 @@ def update_manager():
 def check_updates():
     clear_screen()
     print("[🔄] Checking for updates...")
-    subprocess.run(['git', '-C', '/opt/grvpn', 'remote', 'update'], check=False)
-    status = subprocess.run(['git', '-C', '/opt/grvpn', 'status', '-uno'], capture_output=True, text=True)
-    if "Your branch is behind" in status.stdout:
+    run(['git', '-C', '/opt/grvpn', 'remote', 'update'], check=False)
+    status = run(['git', '-C', '/opt/grvpn', 'status', '-uno'], capture_output=True, text=True, check=False)
+    if status.stdout and "Your branch is behind" in status.stdout:
         print("[✅] Updates available!")
     else:
-        print("[ℹ️] Already up to date.")
+        print("[ℹ️] Already up to date (or not a git checkout).")
     input("\nPress Enter...")
 
 def update_app():
     clear_screen()
-    print("[🔄] Pulling updates from Git...")
-    subprocess.run(['git', '-C', '/opt/grvpn', 'pull'], check=False)
-    # Re-run installer to apply any config changes (idempotent)
-    subprocess.run(['bash', '/opt/grvpn/install.sh'], check=False)
-    print("[✅] Application updated.")
-    input("Press Enter...")
+    print("[🔄] Pulling updates from Git and re-running installer (idempotent — your data/config is preserved)...")
+    run(['git', '-C', '/opt/grvpn', 'pull'], check=False)
+    result = run(['bash', '/opt/grvpn/install.sh'], check=False)
+    if result.returncode == 0:
+        print("[✅] Application updated.")
+    else:
+        print("[⚠️] Installer exited with a non-zero status — check the log below.")
+    input("\nPress Enter...")
 
 def update_deps():
     clear_screen()
-    print("[🔄] Updating system dependencies...")
-    apt update -qq && apt upgrade -y -qq
-    pip3 install --upgrade psutil bcrypt cryptography pyOpenSSL sqlalchemy redis requests colorama prettytable tabulate python-dateutil --quiet
+    print("[🔄] Updating system dependencies to latest versions...")
+    run("apt-get update -qq && apt-get upgrade -y -qq", shell=True, check=False)
+    result = run(['pip3', 'install', '--upgrade', '--break-system-packages',
+                  'psutil', 'bcrypt', 'cryptography', 'pyOpenSSL', 'sqlalchemy', 'redis',
+                  'requests', 'colorama', 'prettytable', 'tabulate', 'python-dateutil', '--quiet'], check=False)
+    if result.returncode != 0:
+        run(['pip3', 'install', '--upgrade',
+             'psutil', 'bcrypt', 'cryptography', 'pyOpenSSL', 'sqlalchemy', 'redis',
+             'requests', 'colorama', 'prettytable', 'tabulate', 'python-dateutil', '--quiet'], check=False)
     print("[✅] Dependencies updated.")
     input("Press Enter...")
 
 def restart_after_update():
     clear_screen()
     for svc in ['nginx', 'ssh', 'stunnel5']:
-        subprocess.run(['systemctl', 'restart', svc], check=False)
+        run(['systemctl', 'restart', svc], check=False)
         print(f"[✅] {svc} restarted!")
     input("Press Enter...")
 
 def view_update_log():
     clear_screen()
-    if os.path.exists('/var/log/grvpn/update.log'):
-        subprocess.run(['tail', '-50', '/var/log/grvpn/update.log'], check=False)
+    if os.path.exists('/var/log/grvpn/install.log'):
+        lines = input("Lines (default 80): ").strip() or "80"
+        run(['tail', f'-{lines}', '/var/log/grvpn/install.log'], check=False)
     else:
-        print("[ℹ️] No update log found.")
+        print("[ℹ️] No install/update log found.")
     input("\nPress Enter...")
 
 # ================== SECURITY MANAGER ==================
@@ -1768,22 +1984,26 @@ def security_manager():
 
 def view_firewall():
     clear_screen()
-    subprocess.run(['ufw', 'status', 'numbered'], check=False)
+    run(['ufw', 'status', 'numbered'], check=False)
     input("\nPress Enter...")
 
 def add_firewall():
     clear_screen()
     port = input("Port: ").strip()
     proto = input("Protocol (tcp/udp): ").strip() or "tcp"
-    subprocess.run(['ufw', 'allow', f"{port}/{proto}"], check=False)
+    if not port.isdigit():
+        print("[❌] Invalid port.")
+        input("Press Enter...")
+        return
+    run(['ufw', 'allow', f"{port}/{proto}"], check=False)
     print(f"[✅] Port {port}/{proto} allowed!")
     input("Press Enter...")
 
 def remove_firewall():
     clear_screen()
-    subprocess.run(['ufw', 'status', 'numbered'], check=False)
+    run(['ufw', 'status', 'numbered'], check=False)
     num = input("Rule number to delete: ").strip()
-    subprocess.run(['ufw', 'delete', num], check=False)
+    run(['ufw', '--force', 'delete', num], check=False)
     print("[✅] Rule deleted!")
     input("Press Enter...")
 
@@ -1813,8 +2033,8 @@ def add_blacklist():
     c.execute("INSERT OR REPLACE INTO ip_rules(ip, action, reason) VALUES(?, 'block', ?)", (ip, reason))
     conn.commit()
     conn.close()
-    subprocess.run(f"iptables -A INPUT -s {ip} -j DROP", shell=True)
-    subprocess.run(['ufw', 'deny', 'from', ip], shell=True)
+    run(['iptables', '-A', 'INPUT', '-s', ip, '-j', 'DROP'], check=False)
+    run(['ufw', 'deny', 'from', ip], check=False)
     print(f"[🛡️] IP {ip} blocked!")
     input("Press Enter...")
 
@@ -1826,18 +2046,18 @@ def remove_blacklist():
     c.execute("UPDATE ip_rules SET is_active=0 WHERE ip=?", (ip,))
     conn.commit()
     conn.close()
-    subprocess.run(f"iptables -D INPUT -s {ip} -j DROP", shell=True)
-    subprocess.run(['ufw', 'delete', 'deny', 'from', ip], shell=True)
+    run(['iptables', '-D', 'INPUT', '-s', ip, '-j', 'DROP'], check=False)
+    run(['ufw', 'delete', 'deny', 'from', ip], check=False)
     print(f"[✅] IP {ip} unblocked!")
     input("Press Enter...")
 
 def fail2ban_status():
     clear_screen()
-    subprocess.run(['fail2ban-client', 'status'], check=False)
+    run(['fail2ban-client', 'status'], check=False)
     input("\nPress Enter...")
 
 def restart_fail2ban():
-    subprocess.run(['systemctl', 'restart', 'fail2ban'], check=False)
+    run(['systemctl', 'restart', 'fail2ban'], check=False)
     print("[✅] Fail2ban restarted!")
     input("Press Enter...")
 
@@ -1852,7 +2072,7 @@ def logs_viewer():
 ║  1.  SSH Logs                                                       ║
 ║  2.  Authentication Logs                                            ║
 ║  3.  Nginx Error Logs                                               ║
-║  4.  Stunnel5 Logs                                                  ║
+║  4.  Stunnel Logs                                                   ║
 ║  5.  Installer Logs                                                 ║
 ║  6.  System Logs                                                    ║
 ║  7.  WebSocket Logs                                                 ║
@@ -1872,32 +2092,26 @@ def logs_viewer():
 def view_ssh_logs():
     clear_screen()
     lines = input("Lines (default 50): ").strip() or "50"
-    subprocess.run(['journalctl', '-u', 'ssh', '-n', lines, '--no-pager'], check=False)
+    run(['journalctl', '-u', 'ssh', '-n', lines, '--no-pager'], check=False)
     input("\nPress Enter...")
 
 def view_auth_logs():
     clear_screen()
     lines = input("Lines (default 50): ").strip() or "50"
-    subprocess.run(['tail', f'-{lines}', '/var/log/auth.log'], check=False)
-    input("\nPress Enter...")
-
-def view_nginx_logs():
-    clear_screen()
-    lines = input("Lines (default 50): ").strip() or "50"
-    subprocess.run(['tail', f'-{lines}', '/var/log/nginx/error.log'], check=False)
+    run(['tail', f'-{lines}', '/var/log/auth.log'], check=False)
     input("\nPress Enter...")
 
 def view_tls_logs():
     clear_screen()
     lines = input("Lines (default 50): ").strip() or "50"
-    subprocess.run(['tail', f'-{lines}', '/var/log/stunnel5.log'], check=False)
+    run(['tail', f'-{lines}', '/var/log/stunnel5.log'], check=False)
     input("\nPress Enter...")
 
 def view_installer_logs():
     clear_screen()
     if os.path.exists('/var/log/grvpn/install.log'):
         lines = input("Lines (default 50): ").strip() or "50"
-        subprocess.run(['tail', f'-{lines}', '/var/log/grvpn/install.log'], check=False)
+        run(['tail', f'-{lines}', '/var/log/grvpn/install.log'], check=False)
     else:
         print("[ℹ️] No installer log found.")
     input("\nPress Enter...")
@@ -1905,16 +2119,16 @@ def view_installer_logs():
 def view_system_logs():
     clear_screen()
     lines = input("Lines (default 50): ").strip() or "50"
-    subprocess.run(['journalctl', '-n', lines, '--no-pager'], check=False)
+    run(['journalctl', '-n', lines, '--no-pager'], check=False)
     input("\nPress Enter...")
 
 def view_ws_logs():
     clear_screen()
     if os.path.exists('/var/log/grvpn/websocat.log'):
         lines = input("Lines (default 50): ").strip() or "50"
-        subprocess.run(['tail', f'-{lines}', '/var/log/grvpn/websocat.log'], check=False)
+        run(['tail', f'-{lines}', '/var/log/grvpn/websocat.log'], check=False)
     else:
-        print("[ℹ️] No WebSocket log found.")
+        print("[ℹ️] No WebSocket log found (check `journalctl -u websocat` instead).")
     input("\nPress Enter...")
 
 # ================== SYSTEM SERVICES ==================
@@ -1949,55 +2163,80 @@ def system_services():
 
 def view_all_services():
     clear_screen()
-    services = ['nginx', 'ssh', 'stunnel5', 'fail2ban']
+    services = ['nginx', 'ssh', 'stunnel5', 'fail2ban', 'websocat']
     table = PrettyTable()
     table.field_names = ["Service", "Status", "Enabled"]
     for svc in services:
-        status = subprocess.run(['systemctl', 'is-active', svc], capture_output=True).stdout.decode().strip()
-        enabled = subprocess.run(['systemctl', 'is-enabled', svc], capture_output=True).stdout.decode().strip()
+        status = run(['systemctl', 'is-active', svc], capture_output=True, check=False).stdout
+        enabled = run(['systemctl', 'is-enabled', svc], capture_output=True, check=False).stdout
+        status = status.decode().strip() if status else "unknown"
+        enabled = enabled.decode().strip() if enabled else "unknown"
         table.add_row([svc, "✅" if status == "active" else "❌", "✅" if enabled == "enabled" else "❌"])
     print(table)
     input("\nPress Enter...")
 
-def start_service():
+ALLOWED_SERVICES = {'nginx', 'ssh', 'stunnel5', 'fail2ban', 'websocat', 'cron'}
+
+def _service_prompt():
     svc = input("Service name: ").strip()
-    subprocess.run(['systemctl', 'start', svc], check=False)
+    if svc not in ALLOWED_SERVICES:
+        print(f"[❌] '{svc}' is not a GRVPN-managed service. Allowed: {', '.join(sorted(ALLOWED_SERVICES))}")
+        return None
+    return svc
+
+def start_service():
+    svc = _service_prompt()
+    if not svc:
+        input("Press Enter..."); return
+    run(['systemctl', 'start', svc], check=False)
     print(f"[✅] {svc} started!")
     input("Press Enter...")
 
 def stop_service():
-    svc = input("Service name: ").strip()
-    subprocess.run(['systemctl', 'stop', svc], check=False)
+    svc = _service_prompt()
+    if not svc:
+        input("Press Enter..."); return
+    run(['systemctl', 'stop', svc], check=False)
     print(f"[✅] {svc} stopped!")
     input("Press Enter...")
 
 def restart_service():
-    svc = input("Service name: ").strip()
-    subprocess.run(['systemctl', 'restart', svc], check=False)
+    svc = _service_prompt()
+    if not svc:
+        input("Press Enter..."); return
+    run(['systemctl', 'restart', svc], check=False)
     print(f"[✅] {svc} restarted!")
     input("Press Enter...")
 
 def reload_service():
-    svc = input("Service name: ").strip()
-    subprocess.run(['systemctl', 'reload', svc], check=False)
+    svc = _service_prompt()
+    if not svc:
+        input("Press Enter..."); return
+    run(['systemctl', 'reload', svc], check=False)
     print(f"[✅] {svc} reloaded!")
     input("Press Enter...")
 
 def enable_service():
-    svc = input("Service name: ").strip()
-    subprocess.run(['systemctl', 'enable', svc], check=False)
+    svc = _service_prompt()
+    if not svc:
+        input("Press Enter..."); return
+    run(['systemctl', 'enable', svc], check=False)
     print(f"[✅] {svc} enabled!")
     input("Press Enter...")
 
 def disable_service():
-    svc = input("Service name: ").strip()
-    subprocess.run(['systemctl', 'disable', svc], check=False)
+    svc = _service_prompt()
+    if not svc:
+        input("Press Enter..."); return
+    run(['systemctl', 'disable', svc], check=False)
     print(f"[✅] {svc} disabled!")
     input("Press Enter...")
 
 def service_status():
-    svc = input("Service name: ").strip()
-    subprocess.run(['systemctl', 'status', svc, '--no-pager'], check=False)
+    svc = _service_prompt()
+    if not svc:
+        input("Press Enter..."); return
+    run(['systemctl', 'status', svc, '--no-pager'], check=False)
     input("\nPress Enter...")
 
 # ================== RUN ==================
@@ -2012,7 +2251,7 @@ PANEL_EOF
 chmod +x "${PANEL_SCRIPT}"
 
 # ─── Symlink ──────────────────────────────────────────────────────────
-echo -e "${BLUE}[🔗] Creating symlink...${NC}"
+log_info "Creating symlink..."
 cat > "${SYMLINK}" << 'SYM_EOF'
 #!/bin/bash
 python3 /opt/grvpn/bin/grvpn-panel.py "$@"
@@ -2020,7 +2259,7 @@ SYM_EOF
 chmod +x "${SYMLINK}"
 
 # ─── WebSocket systemd service ──────────────────────────────────────
-echo -e "${BLUE}[🔧] Creating WebSocket systemd service...${NC}"
+log_info "Creating WebSocket systemd service..."
 cat > /etc/systemd/system/websocat.service << 'WS_SERVICE_EOF'
 [Unit]
 Description=GRVPN WebSocket Proxy
@@ -2041,11 +2280,9 @@ WantedBy=multi-user.target
 WS_SERVICE_EOF
 
 # ─── Cron jobs ────────────────────────────────────────────────────────
-echo -e "${BLUE}[📅] Setting up cron jobs...${NC}"
+log_info "Setting up cron jobs..."
 cat > /etc/cron.d/grvpn << 'CRON_EOF'
 # GRVPN Maintenance Jobs
-# Daily backup at 2 AM
-0 2 * * * root /usr/bin/python3 /opt/grvpn/bin/grvpn-panel.py --backup > /dev/null 2>&1
 # Weekly cleanup at 3 AM Sunday
 0 3 * * 0 root find /opt/grvpn/backups -type f -mtime +30 -delete > /dev/null 2>&1
 # Check expired trials every hour
@@ -2054,14 +2291,20 @@ cat > /etc/cron.d/grvpn << 'CRON_EOF'
 0 2 * * 1 root certbot renew --nginx --quiet > /dev/null 2>&1
 CRON_EOF
 
-systemctl enable cron 2>/dev/null || true
-systemctl restart cron 2>/dev/null || true
+command_exists cron && { systemctl enable cron 2>/dev/null || true; systemctl restart cron 2>/dev/null || true; }
+command_exists crond && { systemctl enable crond 2>/dev/null || true; systemctl restart crond 2>/dev/null || true; }
 
 # ─── Start services ──────────────────────────────────────────────────
-echo -e "${BLUE}[🚀] Starting services...${NC}"
+log_info "Starting services..."
 systemctl daemon-reload
-systemctl enable nginx ssh stunnel5 fail2ban websocat 2>/dev/null || true
-systemctl restart nginx ssh stunnel5 fail2ban websocat 2>/dev/null || true
+for svc in nginx ssh stunnel5 fail2ban websocat; do
+    if systemctl enable "$svc" 2>/dev/null && systemctl restart "$svc" 2>/dev/null; then
+        log_ok "${svc} running."
+    else
+        log_warn "${svc} did not start cleanly — check 'systemctl status ${svc}'."
+        FAILED_STEPS+=("service: ${svc}")
+    fi
+done
 
 # ─── Final message ──────────────────────────────────────────────────
 echo -e "${GREEN}"
@@ -2070,22 +2313,37 @@ echo "║  🐱 GRVPN ENTERPRISE SSH SERVER MANAGER v${VERSION} INSTALLED!      
 echo "╠══════════════════════════════════════════════════════════════════════╣"
 echo "║                                                                      ║"
 echo "║  📌 Run: grvpn                                                       ║"
-echo "║  🔐 Login: grvpn / GRVPN@2026                                       ║"
+if [[ -f "${DATA_DIR}/.admin_credentials" ]]; then
+echo "║  🔐 Admin credentials saved to: /opt/grvpn/data/.admin_credentials  ║"
+fi
 echo "║                                                                      ║"
-echo "║  🌐 Domain: ${DOMAIN}                                                ║"
-echo "║  📡 Certificate: Let's Encrypt (${CERT_TYPE})                       ║"
+echo "║  🌐 Domain: ${DOMAIN}"
 echo "║                                                                      ║"
 echo "║  📡 CONNECTION METHODS:                                              ║"
-echo "║  SSH Direct:  ssh -p 22 username@${DOMAIN}                          ║"
-echo "║  SSH TLS:     ssh -p 443 username@${DOMAIN}                         ║"
-echo "║  WebSocket:   ws://${DOMAIN}/  or  wss://${DOMAIN}/                  ║"
+echo "║  SSH Direct:  ssh -p 22 username@${DOMAIN}"
+echo "║  SSH TLS:     ssh -p 443 username@${DOMAIN}"
+echo "║  WebSocket:   ws://${DOMAIN}/  or  wss://${DOMAIN}/"
 echo "║                                                                      ║"
 echo "║  📂 Install dir: /opt/grvpn                                         ║"
-echo "║  📋 Logs: /var/log/grvpn                                            ║"
-echo "║  🔄 Update: git pull && bash install.sh                             ║"
+echo "║  📋 Logs: /var/log/grvpn/install.log                                ║"
+echo "║  🔄 Update: git pull && bash install.sh   (safe to re-run anytime)  ║"
 echo "║                                                                      ║"
 echo "╚══════════════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
+
+if (( ${#FAILED_PACKAGES[@]} > 0 || ${#FAILED_STEPS[@]} > 0 )); then
+    echo -e "${YELLOW}"
+    echo "──────────────────────────────────────────────────────────────────────"
+    echo " ⚠️  Install finished, but with issues that need your attention:"
+    (( ${#FAILED_PACKAGES[@]} > 0 )) && echo "   • Packages that failed: ${FAILED_PACKAGES[*]}"
+    (( ${#FAILED_STEPS[@]} > 0 ))    && printf '   • Steps that failed: %s\n' "${FAILED_STEPS[*]}"
+    echo " Full log: ${INSTALL_LOG}"
+    echo " Fix the issue and just re-run: bash install.sh — it's idempotent."
+    echo "──────────────────────────────────────────────────────────────────────"
+    echo -e "${NC}"
+else
+    log_ok "Everything installed cleanly."
+fi
 
 # ─── Run panel ────────────────────────────────────────────────────────
 grvpn
