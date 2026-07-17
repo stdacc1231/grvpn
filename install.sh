@@ -211,6 +211,19 @@ EOF
     fi
 fi
 
+# ─── Warn about DNS pointing ───────────────────────────────────────────
+SERVER_IP=$(curl -s ifconfig.me || curl -s icanhazip.com || hostname -I | awk '{print $1}')
+if [[ -n "$SERVER_IP" ]]; then
+    log_info "Your server public IP appears to be: ${SERVER_IP}"
+    log_warn "IMPORTANT: Ensure your domain '${DOMAIN}' has an A record pointing to ${SERVER_IP} before continuing."
+    log_warn "Let's Encrypt will validate ownership via DNS. If the record is not correct, certificate issuance will fail."
+    echo ""
+    read -p "Press Enter to continue (or Ctrl+C to abort and fix DNS)..." 
+else
+    log_warn "Could not automatically detect public IP. Please ensure your domain '${DOMAIN}' is correctly pointed to this server."
+    read -p "Press Enter to continue..." 
+fi
+
 # ─── Directories ────────────────────────────────────────────────────────
 log_info "Creating directory structure..."
 mkdir -p "${INSTALL_DIR}" "${DATA_DIR}" "${CONFIG_DIR}" "${LOG_DIR}" "${BACKUP_DIR}" "${BIN_DIR}"
