@@ -247,29 +247,35 @@ log_info "Setting up Python environment..."
 ensure_pip
 
 if command_exists pip3; then
-    log_info "Upgrading pip and installing required modules..."
+    log_info "Upgrading pip..."
     pip3 install --upgrade pip --quiet || true
 
-    # First, upgrade pyOpenSSL and cryptography to fix certbot issue
-    log_info "Upgrading pyOpenSSL and cryptography..."
-    pip3 install --upgrade pyOpenSSL cryptography --quiet || true
-
-    # Now install other modules without --break-system-packages (it's not supported on older pip)
-    # Use standard install, but if pip version supports it, we'll use it.
-    # We detect if --break-system-packages is accepted.
+    # Detect if --break-system-packages is accepted (must run BEFORE any pip installs)
     if pip3 install --help | grep -q -- "--break-system-packages"; then
         PIP_BREAK="--break-system-packages"
     else
         PIP_BREAK=""
     fi
 
+    # Pin a known-compatible pyOpenSSL/cryptography pair to fix certbot's
+    # "OpenSSL.crypto has no attribute X509Req" crash. Blindly upgrading to
+    # "latest" for both breaks certbot 1.21.0 / josepy, which need this
+    # specific pairing to work.
+    log_info "Installing compatible pyOpenSSL/cryptography pair for certbot..."
+    if ! pip3 install ${PIP_BREAK} --force-reinstall --quiet \
+        "cryptography==41.0.7" "pyOpenSSL==23.2.0"; then
+        log_warn "Pinned install with ${PIP_BREAK} failed, retrying without."
+        pip3 install --force-reinstall --quiet \
+            "cryptography==41.0.7" "pyOpenSSL==23.2.0" || true
+    fi
+
     log_info "Installing Python modules..."
     if ! pip3 install ${PIP_BREAK} --upgrade \
-        psutil bcrypt cryptography pyOpenSSL sqlalchemy redis \
+        psutil bcrypt sqlalchemy redis \
         requests colorama prettytable tabulate python-dateutil --quiet; then
         log_warn "Install with ${PIP_BREAK} failed, retrying without."
         pip3 install --upgrade \
-            psutil bcrypt cryptography pyOpenSSL sqlalchemy redis \
+            psutil bcrypt sqlalchemy redis \
             requests colorama prettytable tabulate python-dateutil --quiet \
             || FAILED_STEPS+=("python module install")
     fi
@@ -1926,11 +1932,14 @@ def update_deps():
     clear_screen()
     print("[🔄] Updating system dependencies to latest versions...")
     run("apt-get update -qq && apt-get upgrade -y -qq", shell=True, check=False)
-    # Update pip and key modules
+    # Update pip itself, but keep pyOpenSSL/cryptography pinned to the
+    # certbot-compatible pair rather than jumping to "latest" (that's what
+    # caused the X509Req breakage in the first place).
     run(['pip3', 'install', '--upgrade', 'pip'], check=False)
-    run(['pip3', 'install', '--upgrade', 'pyOpenSSL', 'cryptography'], check=False)
+    run(['pip3', 'install', '--force-reinstall', '--quiet',
+         'cryptography==41.0.7', 'pyOpenSSL==23.2.0'], check=False)
     result = run(['pip3', 'install', '--upgrade',
-                  'psutil', 'bcrypt', 'cryptography', 'pyOpenSSL', 'sqlalchemy', 'redis',
+                  'psutil', 'bcrypt', 'sqlalchemy', 'redis',
                   'requests', 'colorama', 'prettytable', 'tabulate', 'python-dateutil', '--quiet'], check=False)
     print("[✅] Dependencies updated.")
     input("Press Enter...")
