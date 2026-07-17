@@ -1,20 +1,11 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.4
+# GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.5
 # Let's Encrypt only – Single or Wildcard – Full Management
-# Secure VPN tunnel server – users cannot log in interactively.
-# Update via: git pull && bash install.sh (preserves data/config)
+# Fixed: pip --break-system-packages compatibility, certbot pyOpenSSL issue
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -uo pipefail
-# NOTE: intentionally NOT using 'set -e' globally anymore. With 'set -e', one
-# missing apt package (e.g. a distro-specific name like stunnel5) could kill
-# the whole install silently, which is exactly what caused the reported
-# "pip3: command not found" bug — an earlier package in the same apt line
-# failed, but 2>/dev/null + set -e hid it, and the script marched on assuming
-# python3-pip had been installed when it hadn't. Every critical step below
-# now checks its own exit status, retries flaky network calls, and reports
-# failures loudly at the end instead of failing invisibly.
 
 # ─── Colours ────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -22,10 +13,9 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
 NC='\033[0m'
 
-VERSION="4.0.4"
+VERSION="4.0.5"
 INSTALL_DIR="/opt/grvpn"
 DATA_DIR="${INSTALL_DIR}/data"
 CONFIG_DIR="${INSTALL_DIR}/config"
@@ -39,13 +29,11 @@ WEBSOCAT_BIN="/usr/local/bin/websocat"
 
 mkdir -p /var/log/grvpn
 INSTALL_LOG="/var/log/grvpn/install.log"
-# Mirror everything to a persistent log so failures survive the "Press Enter" loop
 exec > >(tee -a "${INSTALL_LOG}") 2>&1
 
 FAILED_PACKAGES=()
 FAILED_STEPS=()
 
-# ─── Helper functions ───────────────────────────────────────────────────
 log_ok()   { echo -e "${GREEN}[✅] $*${NC}"; }
 log_info() { echo -e "${BLUE}[ℹ️] $*${NC}"; }
 log_warn() { echo -e "${YELLOW}[⚠️] $*${NC}"; }
@@ -53,7 +41,6 @@ log_err()  { echo -e "${RED}[❌] $*${NC}"; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-# Retry a flaky command (network installs, downloads) before giving up
 retry() {
     local tries=3 delay=3 n=1
     until "$@"; do
@@ -66,10 +53,6 @@ retry() {
     done
 }
 
-# Install apt packages ONE AT A TIME so a single missing/renamed package
-# (e.g. stunnel5 vs stunnel4 depending on distro) can never silently take
-# the rest of the list down with it. Already-installed packages are skipped
-# instantly, which is what makes re-running this script for updates cheap.
 apt_install_each() {
     local pkg
     for pkg in "$@"; do
@@ -83,9 +66,6 @@ apt_install_each() {
     done
 }
 
-# Guarantees pip3 exists no matter what state the box is in. This directly
-# fixes the reported bug: python3-pip is now installed, verified, and
-# fallen back on through three layers before we give up.
 ensure_pip() {
     if command_exists pip3; then
         log_ok "pip3 already present."
@@ -98,14 +78,13 @@ ensure_pip() {
         return 0
     fi
     if command_exists python3; then
-        log_warn "apt install of python3-pip failed — trying 'python3 -m ensurepip'."
         python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
     fi
     if command_exists pip3; then
         log_ok "pip3 installed via ensurepip."
         return 0
     fi
-    log_warn "ensurepip failed — bootstrapping pip directly from PyPA (get-pip.py)."
+    log_warn "ensurepip failed — bootstrapping pip directly."
     if curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py 2>/dev/null; then
         python3 /tmp/get-pip.py --quiet || true
         rm -f /tmp/get-pip.py
@@ -114,15 +93,11 @@ ensure_pip() {
         log_ok "pip3 installed via get-pip.py."
         return 0
     fi
-    log_err "Could not install pip3 through any method. Python module install will be skipped — panel may not run until this is fixed manually."
+    log_err "Could not install pip3."
     FAILED_STEPS+=("pip3 bootstrap")
     return 1
 }
 
-# Fetches the tag name of the latest GitHub release for a repo, e.g.
-# latest_github_release vi/websocat  ->  "v1.13.0"
-# Falls back to a pinned known-good version if the API call fails (rate
-# limits, no internet at install time, etc.) so the install never hard-stops.
 latest_github_release() {
     local repo="$1" fallback="$2" tag
     tag=$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
@@ -135,11 +110,12 @@ latest_github_release() {
     fi
 }
 
+# ─── Banner ─────────────────────────────────────────────────────────────
 clear
 echo -e "${CYAN}"
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════════════════╗
-║  🐱 GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.4                     ║
+║  🐱 GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.5                     ║
 ║  Let's Encrypt – Single or Wildcard – Full Management              ║
 ║  Secure VPN Tunnel – No interactive shell for users               ║
 ║  Update via Git: pull and re‑run                                  ║
@@ -147,20 +123,17 @@ cat << "EOF"
 EOF
 echo -e "${NC}"
 
-# ─── Root check ─────────────────────────────────────────────────────────
 if [[ $EUID -ne 0 ]]; then
-    log_err "This script must be run as root."
+    log_err "Run as root."
     exit 1
 fi
 
-# ─── Detect if this is a fresh install or an update ────────────────────
 IS_UPDATE=0
 if [[ -f "${DB_FILE}" ]]; then
     IS_UPDATE=1
     log_info "Existing installation detected — running in UPDATE mode (data/config preserved)."
 fi
 
-# ─── Domain & certificate type (skip re-prompt on update if already set) ─
 EXISTING_DOMAIN=""
 if [[ "$IS_UPDATE" -eq 1 ]] && command_exists sqlite3; then
     EXISTING_DOMAIN=$(sqlite3 "${DB_FILE}" "SELECT value FROM settings WHERE key='domain';" 2>/dev/null || true)
@@ -193,7 +166,6 @@ else
     if [[ "$CERT_TYPE" == "2" ]]; then
         log_warn "Wildcard certificate requires DNS-01 challenge."
         echo "Supported providers: cloudflare, digitalocean, route53, etc."
-        echo "We'll install certbot-dns-cloudflare as default (you can adapt)."
         read -p "Enter Cloudflare API token (or leave blank to use other plugin): " CF_API_TOKEN
         if [[ -n "$CF_API_TOKEN" ]]; then
             mkdir -p /root/.secrets
@@ -203,7 +175,7 @@ EOF
             chmod 600 /root/.secrets/cloudflare.ini
             CERTBOT_PLUGIN="--dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini"
         else
-            log_warn "No API token provided. You will need to manually install the appropriate certbot DNS plugin and adjust the command."
+            log_warn "No API token provided. You will need to manually install the appropriate certbot DNS plugin."
             CERTBOT_PLUGIN="--manual --preferred-challenges dns"
         fi
     else
@@ -211,16 +183,16 @@ EOF
     fi
 fi
 
-# ─── Warn about DNS pointing ───────────────────────────────────────────
+# ─── Warn about DNS ─────────────────────────────────────────────────────
 SERVER_IP=$(curl -s ifconfig.me || curl -s icanhazip.com || hostname -I | awk '{print $1}')
 if [[ -n "$SERVER_IP" ]]; then
     log_info "Your server public IP appears to be: ${SERVER_IP}"
-    log_warn "IMPORTANT: Ensure your domain '${DOMAIN}' has an A record pointing to ${SERVER_IP} before continuing."
-    log_warn "Let's Encrypt will validate ownership via DNS. If the record is not correct, certificate issuance will fail."
+    log_warn "IMPORTANT: Ensure your domain '${DOMAIN}' has an A record pointing to ${SERVER_IP}."
+    log_warn "Let's Encrypt will validate ownership via DNS. If incorrect, certificate issuance will fail."
     echo ""
     read -p "Press Enter to continue (or Ctrl+C to abort and fix DNS)..." 
 else
-    log_warn "Could not automatically detect public IP. Please ensure your domain '${DOMAIN}' is correctly pointed to this server."
+    log_warn "Could not detect public IP. Ensure domain '${DOMAIN}' points to this server."
     read -p "Press Enter to continue..." 
 fi
 
@@ -231,12 +203,12 @@ mkdir -p /etc/grvpn /var/log/grvpn /etc/ssh/sshd_config.d
 mkdir -p /etc/stunnel5 /etc/stunnel /var/run/stunnel5
 chmod 755 /var/run/stunnel5
 
-# ─── Update system ──────────────────────────────────────────────────────
+# ─── System update ─────────────────────────────────────────────────────
 log_info "Updating package index..."
-retry apt-get update -qq || log_warn "apt-get update reported issues — continuing with existing package cache."
-apt-get upgrade -y -qq || log_warn "apt-get upgrade reported issues — continuing."
+retry apt-get update -qq || log_warn "apt-get update reported issues."
+apt-get upgrade -y -qq || log_warn "apt-get upgrade reported issues."
 
-# ─── Install packages (one at a time, self-healing) ────────────────────
+# ─── Install packages ──────────────────────────────────────────────────
 log_info "Installing core packages (missing ones only — safe to re-run)..."
 apt_install_each \
     openssh-server nginx \
@@ -249,8 +221,6 @@ apt_install_each \
     sshuttle iptables \
     build-essential autoconf libtool pkg-config
 
-# stunnel5 doesn't exist on all distros — try it, fall back to stunnel4,
-# and only report a real failure if BOTH are unavailable.
 if ! dpkg -s stunnel5 >/dev/null 2>&1 && ! dpkg -s stunnel4 >/dev/null 2>&1; then
     log_info "Installing stunnel..."
     if ! retry apt-get install -y -qq stunnel5; then
@@ -264,26 +234,41 @@ if command_exists stunnel4 && ! command_exists stunnel5; then
     log_ok "Linked stunnel4 -> stunnel5 for compatibility."
 fi
 
-# Install certbot DNS plugin if wildcard + Cloudflare token was given
 if [[ "${CERT_TYPE:-}" == "2" && -n "${CF_API_TOKEN:-}" ]]; then
     apt_install_each python3-certbot-dns-cloudflare
 fi
 
 if (( ${#FAILED_PACKAGES[@]} > 0 )); then
-    log_warn "The following packages could not be installed and may need manual attention: ${FAILED_PACKAGES[*]}"
+    log_warn "Packages that failed: ${FAILED_PACKAGES[*]}"
 fi
 
-# ─── Python packages (this is the section that broke before) ───────────
+# ─── Python modules ────────────────────────────────────────────────────
 log_info "Setting up Python environment..."
 ensure_pip
+
 if command_exists pip3; then
-    log_info "Installing/upgrading Python modules (latest versions)..."
-    if ! retry pip3 install --upgrade --break-system-packages \
+    log_info "Upgrading pip and installing required modules..."
+    pip3 install --upgrade pip --quiet || true
+
+    # First, upgrade pyOpenSSL and cryptography to fix certbot issue
+    log_info "Upgrading pyOpenSSL and cryptography..."
+    pip3 install --upgrade pyOpenSSL cryptography --quiet || true
+
+    # Now install other modules without --break-system-packages (it's not supported on older pip)
+    # Use standard install, but if pip version supports it, we'll use it.
+    # We detect if --break-system-packages is accepted.
+    if pip3 install --help | grep -q -- "--break-system-packages"; then
+        PIP_BREAK="--break-system-packages"
+    else
+        PIP_BREAK=""
+    fi
+
+    log_info "Installing Python modules..."
+    if ! pip3 install ${PIP_BREAK} --upgrade \
         psutil bcrypt cryptography pyOpenSSL sqlalchemy redis \
         requests colorama prettytable tabulate python-dateutil --quiet; then
-        # Older pip without --break-system-packages support (pre-PEP668) — retry without the flag
-        log_warn "pip3 install with --break-system-packages failed — retrying without it (older pip)."
-        retry pip3 install --upgrade \
+        log_warn "Install with ${PIP_BREAK} failed, retrying without."
+        pip3 install --upgrade \
             psutil bcrypt cryptography pyOpenSSL sqlalchemy redis \
             requests colorama prettytable tabulate python-dateutil --quiet \
             || FAILED_STEPS+=("python module install")
@@ -292,7 +277,7 @@ else
     FAILED_STEPS+=("python module install (no pip3)")
 fi
 
-# ─── websocat (always fetch the latest release, not a stale pin) ───────
+# ─── websocat ──────────────────────────────────────────────────────────
 log_info "Installing websocat (latest release)..."
 WEBSOCAT_TAG=$(latest_github_release "vi/websocat" "v1.13.0")
 WEBSOCAT_URL="https://github.com/vi/websocat/releases/download/${WEBSOCAT_TAG}/websocat.x86_64-unknown-linux-musl"
@@ -302,11 +287,11 @@ if retry wget -q -O "${WEBSOCAT_BIN}.tmp" "${WEBSOCAT_URL}"; then
     log_ok "websocat ${WEBSOCAT_TAG} installed."
 else
     rm -f "${WEBSOCAT_BIN}.tmp"
-    log_err "websocat download failed — WebSocket tunneling will not work until this is fixed."
+    log_err "websocat download failed."
     FAILED_STEPS+=("websocat download")
 fi
 
-# ─── SSL certificate (Let's Encrypt only) ─────────────────────────────
+# ─── SSL certificate ──────────────────────────────────────────────────
 log_info "Obtaining/verifying Let's Encrypt certificate for ${DOMAIN}..."
 systemctl stop nginx 2>/dev/null || true
 
@@ -314,17 +299,21 @@ CERT_PATH="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
 KEY_PATH="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
 
 if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
-    log_ok "Existing certificate for ${DOMAIN} found — skipping re-issuance (use Domain Manager > Renew to refresh)."
+    log_ok "Existing certificate found — skipping re-issuance (use Domain Manager > Renew to refresh)."
 else
     CERTBOT_CMD="certbot certonly ${CERTBOT_PLUGIN} -d ${DOMAIN} --non-interactive --agree-tos -m admin@${DOMAIN} --keep-until-expiring"
     if [[ "$CERT_TYPE" == "2" ]]; then
         CERTBOT_CMD="certbot certonly ${CERTBOT_PLUGIN} -d ${DOMAIN} -d *.${DOMAIN} --non-interactive --agree-tos -m admin@${DOMAIN} --keep-until-expiring"
     fi
+    # Try twice: first with standard, then with --force-renewal if it fails
     if ! eval "$CERTBOT_CMD"; then
-        log_err "Let's Encrypt certificate issuance failed."
-        log_err "Check your domain's DNS points at this server and try again."
-        log_err "No self-signed fallback is provided. Exiting."
-        exit 1
+        log_warn "First certificate issuance attempt failed. Trying with --force-renewal..."
+        if ! eval "$CERTBOT_CMD --force-renewal"; then
+            log_err "Let's Encrypt certificate issuance failed."
+            log_err "Check domain DNS and try again."
+            log_err "No self-signed fallback. Exiting."
+            exit 1
+        fi
     fi
 fi
 
@@ -339,7 +328,7 @@ else
     exit 1
 fi
 
-# ─── SSH Hardening (defaults, no menu) ────────────────────────────────
+# ─── SSH Hardening ──────────────────────────────────────────────────────
 log_info "Configuring SSH (secure defaults)..."
 cat > /etc/ssh/sshd_config << 'EOF'
 # GRVPN Enterprise SSH Configuration – Secure by default
@@ -399,11 +388,11 @@ ssh-keygen -A
 if sshd -t 2>/dev/null; then
     log_ok "sshd config validated."
 else
-    log_err "sshd config failed validation! Not restarting SSH — fix /etc/ssh/sshd_config manually before continuing."
+    log_err "sshd config validation failed! Not restarting SSH."
     FAILED_STEPS+=("sshd config validation")
 fi
 
-# ─── Nginx Configuration (fixed root "/" for WS) ──────────────────────
+# ─── Nginx Configuration ──────────────────────────────────────────────
 log_info "Configuring Nginx..."
 cat > /etc/nginx/sites-available/grvpn << EOF
 server {
@@ -433,7 +422,6 @@ server {
     ssl_session_timeout 1d;
     ssl_session_tickets off;
 
-    # WebSocket ROOT "/" – fixed
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
@@ -465,11 +453,11 @@ rm -f /etc/nginx/sites-enabled/default
 if nginx -t 2>/dev/null; then
     log_ok "nginx config validated."
 else
-    log_err "nginx config failed validation! Check /etc/nginx/sites-available/grvpn manually."
+    log_err "nginx config validation failed."
     FAILED_STEPS+=("nginx config validation")
 fi
 
-# ─── Stunnel5 Configuration ─────────────────────────────────────────────
+# ─── Stunnel5 Configuration ────────────────────────────────────────────
 log_info "Configuring Stunnel..."
 mkdir -p /etc/stunnel5 /var/run/stunnel5
 chmod 755 /var/run/stunnel5
@@ -568,14 +556,14 @@ maxretry = 3
 bantime = 7200
 FAIL2BAN_EOF
 
-# ─── Firewall (UFW) ────────────────────────────────────────────────────
-log_info "Configuring UFW firewall..."
+# ─── Firewall ──────────────────────────────────────────────────────────
+log_info "Configuring UFW..."
 for port in 22 80 443 8443 2052 2053 2082 2083 2086 2087 2095 2096 8880 8080; do
     ufw allow "$port"/tcp 2>/dev/null || true
 done
 ufw --force enable 2>/dev/null || true
 
-# ─── Kernel tuning (idempotent — won't duplicate on re-run/update) ─────
+# ─── Kernel tuning ─────────────────────────────────────────────────────
 log_info "Optimising kernel parameters..."
 if ! grep -q "# GRVPN Kernel Optimization" /etc/sysctl.conf 2>/dev/null; then
     cat >> /etc/sysctl.conf << 'KERNEL_EOF'
@@ -610,7 +598,7 @@ else
 fi
 sysctl -p 2>/dev/null || true
 
-# ─── File limits (idempotent) ───────────────────────────────────────────
+# ─── File limits ──────────────────────────────────────────────────────
 log_info "Setting file limits..."
 if ! grep -q "# GRVPN Limits" /etc/security/limits.conf 2>/dev/null; then
     cat >> /etc/security/limits.conf << 'LIMITS_EOF'
@@ -628,7 +616,7 @@ else
     log_info "File limits already applied — skipping duplicate append."
 fi
 
-# ─── Database ───────────────────────────────────────────────────────────
+# ─── Database ──────────────────────────────────────────────────────────
 log_info "Setting up database (existing data preserved if present)..."
 mkdir -p "${DATA_DIR}"
 sqlite3 "${DB_FILE}" << 'SQL_EOF'
@@ -721,7 +709,7 @@ CREATE TABLE IF NOT EXISTS backups (
 INSERT OR IGNORE INTO settings (key, value) VALUES
     ('domain', 'DOMAIN_PLACEHOLDER'),
     ('server_name', 'GRVPN Enterprise Server'),
-    ('version', '4.0.4'),
+    ('version', '4.0.5'),
     ('trial_duration', '30'),
     ('default_data_limit', '0'),
     ('default_download_speed', '0'),
@@ -733,7 +721,7 @@ SQL_EOF
 sqlite3 "${DB_FILE}" "UPDATE settings SET value='$DOMAIN' WHERE key='domain';"
 sqlite3 "${DB_FILE}" "UPDATE settings SET value='${VERSION}' WHERE key='version';"
 
-# ─── Admin user (only created once — never overwrites an existing admin) ─
+# ─── Admin user ────────────────────────────────────────────────────────
 log_info "Ensuring admin user exists..."
 if command_exists python3; then
 python3 << PYTHON_ADMIN
@@ -754,9 +742,9 @@ if not c.fetchone():
             f.write(f"username: grvpn\npassword: {pwd_plain}\n")
         import os
         os.chmod('/opt/grvpn/data/.admin_credentials', 0o600)
-        print(f"[OK] Admin user created. Credentials saved to /opt/grvpn/data/.admin_credentials (root-only, chmod 600).")
+        print("[OK] Admin user created. Credentials saved to /opt/grvpn/data/.admin_credentials (root-only, chmod 600).")
     except ImportError:
-        print("[WARN] bcrypt module missing — admin user NOT created. Re-run this script after fixing the Python module install.")
+        print("[WARN] bcrypt module missing — admin user NOT created. Re-run after fixing Python modules.")
 else:
     print("[INFO] Admin user already exists — leaving password untouched.")
 conn.close()
@@ -771,7 +759,7 @@ log_info "Deploying GRVPN Enterprise Panel..."
 cat > "${PANEL_SCRIPT}" << 'PANEL_EOF'
 #!/usr/bin/env python3
 """
-GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.4
+GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.5
 Full-featured CLI management panel
 """
 import os, sys, sqlite3, subprocess, time, json, uuid
@@ -784,12 +772,12 @@ try:
     colorama.init()
 except ImportError as e:
     print(f"[❌] Missing Python module: {e.name}")
-    print("Run: pip3 install --break-system-packages psutil bcrypt prettytable colorama")
+    print("Run: pip3 install --upgrade psutil bcrypt prettytable colorama")
     sys.exit(1)
 
 INSTALL_DIR = '/opt/grvpn'
 DB = f'{INSTALL_DIR}/data/grvpn.db'
-VERSION = '4.0.4'
+VERSION = '4.0.5'
 
 def get_conn():
     return sqlite3.connect(DB)
@@ -883,7 +871,6 @@ def set_setting(key, value):
     conn.close()
 
 def run(cmd, **kwargs):
-    """subprocess.run wrapper that never raises — always returns a CompletedProcess-like result."""
     try:
         return subprocess.run(cmd, **kwargs)
     except FileNotFoundError:
@@ -1138,7 +1125,7 @@ def edit_user():
             return
     conn = get_conn()
     c = conn.cursor()
-    c.execute(f"UPDATE users SET {field}=? WHERE id=?", (value, user['id']))  # field is whitelisted above
+    c.execute(f"UPDATE users SET {field}=? WHERE id=?", (value, user['id']))
     conn.commit()
     conn.close()
     log_activity(user['id'], 'user_updated', details=f'{field}={value}')
@@ -1939,13 +1926,12 @@ def update_deps():
     clear_screen()
     print("[🔄] Updating system dependencies to latest versions...")
     run("apt-get update -qq && apt-get upgrade -y -qq", shell=True, check=False)
-    result = run(['pip3', 'install', '--upgrade', '--break-system-packages',
+    # Update pip and key modules
+    run(['pip3', 'install', '--upgrade', 'pip'], check=False)
+    run(['pip3', 'install', '--upgrade', 'pyOpenSSL', 'cryptography'], check=False)
+    result = run(['pip3', 'install', '--upgrade',
                   'psutil', 'bcrypt', 'cryptography', 'pyOpenSSL', 'sqlalchemy', 'redis',
                   'requests', 'colorama', 'prettytable', 'tabulate', 'python-dateutil', '--quiet'], check=False)
-    if result.returncode != 0:
-        run(['pip3', 'install', '--upgrade',
-             'psutil', 'bcrypt', 'cryptography', 'pyOpenSSL', 'sqlalchemy', 'redis',
-             'requests', 'colorama', 'prettytable', 'tabulate', 'python-dateutil', '--quiet'], check=False)
     print("[✅] Dependencies updated.")
     input("Press Enter...")
 
