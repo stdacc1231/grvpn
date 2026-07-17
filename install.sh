@@ -1,9 +1,8 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.8
-# Let's Encrypt only – Single or Wildcard – Full Management
-# Backend on random port, Nginx proxies all CF ports
-# Account info format as requested
+# GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.9 – VPN TUNNEL EDITION
+# Let's Encrypt via acme.sh – Single or Wildcard – Full Management
+# Clean account info – only essential data for Open Tunnel VPN
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -uo pipefail
@@ -16,7 +15,7 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-VERSION="4.0.8"
+VERSION="4.0.9"
 INSTALL_DIR="/opt/grvpn"
 DATA_DIR="${INSTALL_DIR}/data"
 CONFIG_DIR="${INSTALL_DIR}/config"
@@ -27,6 +26,7 @@ DB_FILE="${DATA_DIR}/grvpn.db"
 PANEL_SCRIPT="${BIN_DIR}/grvpn-panel.py"
 SYMLINK="/usr/local/bin/grvpn"
 WEBSOCAT_BIN="/usr/local/bin/websocat"
+ACME_SH="$HOME/.acme.sh/acme.sh"
 
 mkdir -p /var/log/grvpn
 INSTALL_LOG="/var/log/grvpn/install.log"
@@ -115,10 +115,9 @@ clear
 echo -e "${CYAN}"
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════════════════╗
-║  🐱 GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.8                     ║
-║  Let's Encrypt – Single or Wildcard – Full Management              ║
-║  Random backend port + Nginx proxy on all Cloudflare ports         ║
-║  Account info format as requested                                  ║
+║  🐱 GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.9                     ║
+║  VPN TUNNEL EDITION – acme.sh (Let's Encrypt)                     ║
+║  Clean account info – only what you need for Open Tunnel VPN       ║
 ╚══════════════════════════════════════════════════════════════════════╝
 EOF
 echo -e "${NC}"
@@ -143,7 +142,6 @@ if [[ -n "$EXISTING_DOMAIN" ]]; then
     log_info "Using existing domain: ${EXISTING_DOMAIN}"
     DOMAIN="$EXISTING_DOMAIN"
     CERT_TYPE="1"
-    CERTBOT_PLUGIN="--standalone --preferred-challenges http"
 else
     echo -e "${BLUE}[🌐] Domain setup${NC}"
     echo "Select certificate type:"
@@ -161,25 +159,6 @@ else
     if [[ -z "$DOMAIN" ]]; then
         log_err "Domain cannot be empty."
         exit 1
-    fi
-
-    if [[ "$CERT_TYPE" == "2" ]]; then
-        log_warn "Wildcard certificate requires DNS-01 challenge."
-        echo "Supported providers: cloudflare, digitalocean, route53, etc."
-        read -p "Enter Cloudflare API token (or leave blank to use other plugin): " CF_API_TOKEN
-        if [[ -n "$CF_API_TOKEN" ]]; then
-            mkdir -p /root/.secrets
-            cat > /root/.secrets/cloudflare.ini <<EOF
-dns_cloudflare_api_token = $CF_API_TOKEN
-EOF
-            chmod 600 /root/.secrets/cloudflare.ini
-            CERTBOT_PLUGIN="--dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini"
-        else
-            log_warn "No API token provided. You will need to manually install the appropriate certbot DNS plugin."
-            CERTBOT_PLUGIN="--manual --preferred-challenges dns"
-        fi
-    else
-        CERTBOT_PLUGIN="--standalone --preferred-challenges http"
     fi
 fi
 
@@ -212,14 +191,15 @@ apt-get upgrade -y -qq || log_warn "apt-get upgrade reported issues."
 log_info "Installing core packages (missing ones only — safe to re-run)..."
 apt_install_each \
     openssh-server nginx \
-    certbot python3-certbot-nginx python3-pip python3-venv \
+    python3-pip python3-venv \
     screen tmux ufw fail2ban redis-server \
     sqlite3 bc net-tools iptables-persistent \
     curl wget git unzip jq htop nload \
     openssl netcat-openbsd socat python3-bcrypt \
     apache2-utils whois dnsutils uuid-runtime \
     sshuttle iptables \
-    build-essential autoconf libtool pkg-config
+    build-essential autoconf libtool pkg-config \
+    cron socat
 
 if ! dpkg -s stunnel5 >/dev/null 2>&1 && ! dpkg -s stunnel4 >/dev/null 2>&1; then
     log_info "Installing stunnel..."
@@ -232,10 +212,6 @@ fi
 if command_exists stunnel4 && ! command_exists stunnel5; then
     ln -sf "$(command -v stunnel4)" /usr/bin/stunnel5
     log_ok "Linked stunnel4 -> stunnel5 for compatibility."
-fi
-
-if [[ "${CERT_TYPE:-}" == "2" && -n "${CF_API_TOKEN:-}" ]]; then
-    apt_install_each python3-certbot-dns-cloudflare
 fi
 
 if (( ${#FAILED_PACKAGES[@]} > 0 )); then
@@ -256,14 +232,6 @@ if command_exists pip3; then
         PIP_BREAK=""
     fi
 
-    log_info "Installing compatible pyOpenSSL/cryptography pair for certbot..."
-    if ! pip3 install ${PIP_BREAK} --force-reinstall --quiet \
-        "cryptography==41.0.7" "pyOpenSSL==23.2.0"; then
-        log_warn "Pinned install with ${PIP_BREAK} failed, retrying without."
-        pip3 install --force-reinstall --quiet \
-            "cryptography==41.0.7" "pyOpenSSL==23.2.0" || true
-    fi
-
     log_info "Installing Python modules..."
     if ! pip3 install ${PIP_BREAK} --upgrade \
         psutil bcrypt sqlalchemy redis \
@@ -277,6 +245,17 @@ if command_exists pip3; then
 else
     FAILED_STEPS+=("python module install (no pip3)")
 fi
+
+# ─── Install acme.sh ──────────────────────────────────────────────────
+log_info "Installing acme.sh (Let's Encrypt client)..."
+if [ ! -f "$ACME_SH" ]; then
+    curl -fsSL https://get.acme.sh | sh -s email=admin@"$DOMAIN" || {
+        log_err "acme.sh installation failed."
+        exit 1
+    }
+fi
+export PATH="$HOME/.acme.sh:$PATH"
+log_ok "acme.sh installed."
 
 # ─── websocat ──────────────────────────────────────────────────────────
 log_info "Installing websocat (latest release)..."
@@ -292,58 +271,48 @@ else
     FAILED_STEPS+=("websocat download")
 fi
 
-# ─── SSL certificate ──────────────────────────────────────────────────
-log_info "Obtaining/verifying Let's Encrypt certificate for ${DOMAIN}..."
-systemctl stop nginx 2>/dev/null || true
-
-CERT_PATH="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-KEY_PATH="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
-
-if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
-    log_ok "Existing certificate found — skipping re-issuance (use Domain Manager > Renew to refresh)."
-else
-    CERTBOT_CMD="certbot certonly ${CERTBOT_PLUGIN} -d ${DOMAIN} --non-interactive --agree-tos -m admin@${DOMAIN} --keep-until-expiring"
-    if [[ "$CERT_TYPE" == "2" ]]; then
-        CERTBOT_CMD="certbot certonly ${CERTBOT_PLUGIN} -d ${DOMAIN} -d *.${DOMAIN} --non-interactive --agree-tos -m admin@${DOMAIN} --keep-until-expiring"
-    fi
-    if ! eval "$CERTBOT_CMD"; then
-        log_warn "First certificate issuance attempt failed. Trying with --force-renewal..."
-        if ! eval "$CERTBOT_CMD --force-renewal"; then
-            log_err "Let's Encrypt certificate issuance failed."
-            log_err "Check domain DNS and try again."
-            log_err "No self-signed fallback. Exiting."
-            exit 1
-        fi
-    fi
-fi
-
-if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
-    cp "$CERT_PATH" /etc/ssl/grvpn.pem
-    cp "$KEY_PATH" /etc/ssl/grvpn.key
-    chmod 600 /etc/ssl/grvpn.key
-    chmod 644 /etc/ssl/grvpn.pem
-    log_ok "Certificate installed."
-else
-    log_err "Certificate files not found. Exiting."
-    exit 1
-fi
-
 # ─── Generate random port for WebSocket backend ───────────────────────
-# Store it in the database so it persists across updates.
-# If port already exists in settings, read it; else generate new.
 WS_BACKEND_PORT=""
 if [[ -f "$DB_FILE" ]]; then
     WS_BACKEND_PORT=$(sqlite3 "$DB_FILE" "SELECT value FROM settings WHERE key='ws_backend_port';" 2>/dev/null || true)
 fi
 if [[ -z "$WS_BACKEND_PORT" ]]; then
-    # Generate random port between 10000 and 60000
     WS_BACKEND_PORT=$(( RANDOM % 50000 + 10000 ))
-    # Ensure the port is not in use (simple check, we'll rely on systemd to fail if occupied)
 fi
-# Update settings with this port
 sqlite3 "$DB_FILE" "INSERT OR REPLACE INTO settings (key, value) VALUES ('ws_backend_port', '$WS_BACKEND_PORT');" 2>/dev/null || true
-
 log_ok "WebSocket backend will listen on port $WS_BACKEND_PORT."
+
+# ─── SSL certificate via acme.sh ──────────────────────────────────────
+log_info "Obtaining SSL certificate for ${DOMAIN} using acme.sh..."
+systemctl stop nginx 2>/dev/null || true
+
+if [[ "$CERT_TYPE" == "2" ]]; then
+    log_warn "Wildcard DNS challenge requires API credentials for your DNS provider."
+    log_info "Please ensure acme.sh is configured with your DNS API."
+    # Attempt to issue wildcard – this may fail if no DNS API set.
+    if ! $HOME/.acme.sh/acme.sh --issue -d "$DOMAIN" -d "*.${DOMAIN}" --dns --force 2>/dev/null; then
+        log_err "Wildcard issuance failed. Please set up DNS API for acme.sh."
+        log_err "You can manually run: acme.sh --issue -d $DOMAIN -d *.${DOMAIN} --dns"
+        exit 1
+    fi
+else
+    # Standalone HTTP-01
+    if ! $HOME/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone --force; then
+        log_err "Certificate issuance failed. Check domain DNS."
+        exit 1
+    fi
+fi
+
+# Install certificate to system location
+$HOME/.acme.sh/acme.sh --install-cert -d "$DOMAIN" \
+    --cert-file /etc/ssl/grvpn.pem \
+    --key-file /etc/ssl/grvpn.key \
+    --fullchain-file /etc/ssl/grvpn-fullchain.pem \
+    --reloadcmd "systemctl reload nginx" || {
+    log_err "Failed to install certificate."
+    exit 1
+}
+log_ok "Certificate installed to /etc/ssl/grvpn.pem and /etc/ssl/grvpn.key"
 
 # ─── SSH Hardening ──────────────────────────────────────────────────────
 log_info "Configuring SSH (secure defaults)..."
@@ -409,7 +378,7 @@ else
     FAILED_STEPS+=("sshd config validation")
 fi
 
-# ─── Nginx Configuration (proxies to random backend port) ─────────────
+# ─── Nginx Configuration ──────────────────────────────────────────────
 log_info "Configuring Nginx with backend on port $WS_BACKEND_PORT..."
 cat > /etc/nginx/sites-available/grvpn << EOF
 server {
@@ -578,8 +547,6 @@ log_info "Configuring UFW..."
 for port in 22 80 443 8443 2052 2053 2082 2083 2086 2087 2095 2096 8880; do
     ufw allow "$port"/tcp 2>/dev/null || true
 done
-# also allow the random backend port (just in case, but it's local only)
-# ufw allow $WS_BACKEND_PORT/tcp  # not needed, localhost only
 ufw --force enable 2>/dev/null || true
 
 # ─── Kernel tuning ─────────────────────────────────────────────────────
@@ -728,7 +695,7 @@ CREATE TABLE IF NOT EXISTS backups (
 INSERT OR IGNORE INTO settings (key, value) VALUES
     ('domain', 'DOMAIN_PLACEHOLDER'),
     ('server_name', 'GRVPN Enterprise Server'),
-    ('version', '4.0.8'),
+    ('version', '4.0.9'),
     ('trial_duration', '30'),
     ('default_data_limit', '0'),
     ('default_download_speed', '0'),
@@ -778,8 +745,8 @@ log_info "Deploying GRVPN Enterprise Panel..."
 cat > "${PANEL_SCRIPT}" << 'PANEL_EOF'
 #!/usr/bin/env python3
 """
-GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.8
-Full-featured CLI management panel
+GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.9 – VPN TUNNEL EDITION
+Clean account info – only essential data for Open Tunnel VPN
 """
 import os, sys, sqlite3, subprocess, time, json, uuid, socket, random
 from datetime import datetime, timedelta
@@ -796,7 +763,7 @@ except ImportError as e:
 
 INSTALL_DIR = '/opt/grvpn'
 DB = f'{INSTALL_DIR}/data/grvpn.db'
-VERSION = '4.0.8'
+VERSION = '4.0.9'
 
 def get_conn():
     return sqlite3.connect(DB)
@@ -906,68 +873,37 @@ def run(cmd, **kwargs):
         print(f"[❌] Command not found: {cmd[0] if isinstance(cmd, list) else cmd}")
         return subprocess.CompletedProcess(cmd, 127)
 
-def print_connection_info(username, ssh_port, ws_port):
+def print_account_info(username, ssh_port, ws_port, data_limit, dl_speed, ul_speed, ip_limit, expires_at, password=""):
     domain = get_domain()
     server_ip = get_server_ip()
+    expiry_str = expires_at if expires_at else "Never"
     
-    # Get current date/time for creation
-    created = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    # Expiry if set
-    user = get_user(username)
-    expiry = user.get('expires_at', None) if user else None
-    if expiry:
-        expiry_str = expiry
+    print("\n" + "="*50)
+    print("🐱 GRVPN ACCOUNT INFORMATION (Open Tunnel VPN)")
+    print("="*50)
+    print(f"IP/Host        : {server_ip}")
+    print(f"Domain         : {domain}")
+    print(f"Username       : {username}")
+    if password:
+        print(f"Password       : {password}")
     else:
-        expiry_str = 'Never'
-    
-    # Build output as requested
-    print("\n" + "="*40)
-    print(f"Username: {username}")
-    print(f"Password: {user.get('password', 'N/A') if user else 'N/A'}")  # we don't store plaintext, so we can't show password; we can show placeholder or skip.
-    # Since we can't show plaintext password, we'll show a note.
-    # In practice, we could print the password at creation time, but we don't store it. We'll adjust create_user to store a temporary password? We'll handle in create_user.
-    print(f"Created: {created}")
-    print(f"Expired: {expiry_str}")
-    print("===========HOST-SSH===========")
-    print(f"IP/Host: {server_ip}")
-    print(f"Domain SSH: {domain}")
-    print(f"Domain Cloudflare: {domain}")
-    print("Domain CloudFront: ")
-    print("===========SLOWDNS===========")
-    print("Domain Name System(DNS): 8.8.8.8")
-    print("Name Server(NS): slowdns-60i2j.mantapxsl.my.id")  # placeholder
-    print("DNS PUBLIC KEY: 7fbd1f8aa0abfe15a7903e837f78aba39cf61d36f183bd604daa2fe4ef3b7b59")  # placeholder
-    print("Domain SlowDNS: slowdns-60i2j.mantapxsl.my.id")  # placeholder
-    print("=========Service-Port=========")
-    print("SlowDNS: 443,22,109,143")  # placeholder
-    print(f"OpenSSH: 22")
-    print("Dropbear: 443, 109, 143")  # placeholder
-    print(f"SSL/TLS: 443, 8443, 2053, 2083, 2087, 2096")
-    print(f"SSH Websocket SSL/TLS: 443, 8443, 2053, 2083, 2087, 2096")
-    print(f"SSH Websocket HTTP: 80, 2052, 2082, 2086, 2095, 8880")
-    print("BadVPN UDPGW: 7100,7200,7300")  # placeholder
-    print("Proxy CloudFront: [OFF]")
-    print("Proxy Squid: [OFF]")
-    print("OHP SSH: 8181")  # placeholder
-    print("OHP Dropbear: 8282")  # placeholder
-    print("OHP OpenVPN: 8383")  # placeholder
-    print("OVPN Websocket: 2086")  # placeholder
-    print("OVPN Port TCP: 1194")  # placeholder
-    print("OVPN Port UDP: 2200")  # placeholder
-    print("OVPN Port SSL: 990")  # placeholder
-    print("OVPN TCP: http://{}:89/tcp.ovpn".format(server_ip))  # placeholder
-    print("OVPN UDP: http://{}:89/udp.ovpn".format(server_ip))  # placeholder
-    print("OVPN SSL: http://{}:89/ssl.ovpn".format(server_ip))  # placeholder
-    print("==============================")
-    print("SNI/Server Spoof: isi dengan bug")
-    print("Payload Websocket SSL/TLS")
-    print("==============================")
-    print(f"GET wss://bug.com/ HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]")
-    print("==============================")
-    print("Payload Websocket HTTP")
-    print("==============================")
-    print(f"GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]")
-    print("="*40)
+        print("Password       : (hidden – use change password)")
+    print(f"SSH Direct     : port {ssh_port} (no TLS)")
+    print(f"SSH TLS        : port 443, 8443, 2053, 2083, 2087, 2096")
+    print(f"SSH WS HTTP    : port 80, 2052, 2082, 2086, 2095, 8880")
+    print(f"SSH WS TLS     : port 443, 8443, 2053, 2083, 2087, 2096")
+    print(f"Data Limit     : {data_limit} GB" if data_limit > 0 else "Data Limit     : ∞ (unlimited)")
+    print(f"Download Speed : {dl_speed} Mbps" if dl_speed > 0 else "Download Speed : ∞ (unlimited)")
+    print(f"Upload Speed   : {ul_speed} Mbps" if ul_speed > 0 else "Upload Speed   : ∞ (unlimited)")
+    print(f"IP Limit       : {ip_limit}" if ip_limit > 0 else "IP Limit       : ∞ (unlimited)")
+    print(f"Expires        : {expiry_str}")
+    print("\n📡 PAYLOAD EXAMPLES")
+    print("------------------")
+    print("For WSS (TLS):")
+    print(f"  GET wss://bug.com/ HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]")
+    print("For WS (HTTP):")
+    print(f"  GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]")
+    print("="*50)
 
 # ================== MAIN MENU ==================
 def main_menu():
@@ -1121,10 +1057,6 @@ def create_user():
     conn.commit()
     conn.close()
 
-    # Save plain password for display (only during creation)
-    # We'll store it temporarily in a file? Better: We'll just display it now.
-    # We'll also keep it in the logs? Not secure. We'll just print.
-    
     with open(f'/etc/ssh/sshd_config.d/{username}.conf', 'w') as f:
         f.write(f"Match User {username}\n")
         f.write(f"    Port {ssh_port}\n")
@@ -1134,12 +1066,8 @@ def create_user():
         f.write("    TCPKeepAlive yes\n")
     run(['systemctl', 'reload', 'ssh'], check=False)
     log_activity(user_id, 'user_created', details=f'Data:{data_limit}GB DL:{dl_speed} UL:{ul_speed} IP:{ip_limit}')
-    print(f"\n[✅] User created: {username}")
-    print(f"    Password: {password}")  # show once
-    print(f"    SSH Port: {ssh_port}")
-    print(f"    WS Port: {ws_port}")
-    print(f"    Expiry: {expires_at if expires_at else 'Never'}")
-    print_connection_info(username, ssh_port, ws_port)
+    
+    print_account_info(username, ssh_port, ws_port, data_limit, dl_speed, ul_speed, ip_limit, expires_at, password)
     input("\nPress Enter...")
 
 def create_trial():
@@ -1165,15 +1093,18 @@ def create_trial():
     ws_port = get_free_port(4000)
     data_limit = 10
     ip_limit = 2
+    # Speeds unlimited
+    dl_speed = 0
+    ul_speed = 0
     pwd_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
     conn = get_conn()
     c = conn.cursor()
     c.execute('''INSERT INTO users
         (username, password, is_trial, is_active, ssh_port, ws_port, expires_at,
-         data_limit, ip_limit)
-        VALUES(?,?,?,?,?,?,?,?,?)''',
+         data_limit, ip_limit, download_speed, upload_speed)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
         (username, pwd_hash, 1, 1, ssh_port, ws_port, expiry.isoformat(),
-         data_limit, ip_limit))
+         data_limit, ip_limit, dl_speed, ul_speed))
     user_id = c.lastrowid
     conn.commit()
     conn.close()
@@ -1186,15 +1117,8 @@ def create_trial():
         f.write("    TCPKeepAlive yes\n")
     run(['systemctl', 'reload', 'ssh'], check=False)
     log_activity(user_id, 'trial_created', details=f'Duration:{minutes}min')
-    print(f"\n[✅] Trial user created!")
-    print(f"    Username: {username}")
-    print(f"    Password: {password}")
-    print(f"    Expires: {expiry.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"    SSH Port: {ssh_port}")
-    print(f"    WS Port: {ws_port}")
-    print(f"    Data Limit: {data_limit}GB")
-    print(f"    IP Limit: {ip_limit}")
-    print_connection_info(username, ssh_port, ws_port)
+    
+    print_account_info(username, ssh_port, ws_port, data_limit, dl_speed, ul_speed, ip_limit, expiry.isoformat(), password)
     input("\nPress Enter...")
 
 def edit_user():
@@ -1426,28 +1350,26 @@ def domain_manager():
 ║  1.  View Current Domain                                            ║
 ║  2.  Set Primary Domain                                             ║
 ║  3.  Replace Domain (with new certificate)                          ║
-║  4.  Regenerate Let's Encrypt Certificate                           ║
-║  5.  Renew Certificate                                              ║
-║  6.  Install Custom Certificate                                     ║
-║  7.  Install Custom Private Key                                     ║
-║  8.  Validate Certificate                                           ║
-║  9.  Display Certificate Expiry                                     ║
-║  10. Restart Affected Services                                      ║
-║  11. Back to Main                                                   ║
+║  4.  Renew Certificate                                              ║
+║  5.  Install Custom Certificate                                     ║
+║  6.  Install Custom Private Key                                     ║
+║  7.  Validate Certificate                                           ║
+║  8.  Display Certificate Expiry                                     ║
+║  9.  Restart Affected Services                                      ║
+║  10. Back to Main                                                   ║
 ╚══════════════════════════════════════════════════════════════════════╝
         """)
         choice = input("🐱 Choice: ").strip()
         if choice == '1': view_domain()
         elif choice == '2': set_domain()
         elif choice == '3': replace_domain()
-        elif choice == '4': regenerate_cert()
-        elif choice == '5': renew_cert()
-        elif choice == '6': install_custom_cert()
-        elif choice == '7': install_custom_key()
-        elif choice == '8': validate_cert()
-        elif choice == '9': cert_expiry()
-        elif choice == '10': restart_services()
-        elif choice == '11': break
+        elif choice == '4': renew_cert()
+        elif choice == '5': install_custom_cert()
+        elif choice == '6': install_custom_key()
+        elif choice == '7': validate_cert()
+        elif choice == '8': cert_expiry()
+        elif choice == '9': restart_services()
+        elif choice == '10': break
 
 def view_domain():
     clear_screen()
@@ -1483,12 +1405,11 @@ def replace_domain():
         print("[❌] Domain required!")
         input("Press Enter...")
         return
-    print("[🔐] Obtaining new certificate...")
+    print("[🔐] Obtaining new certificate via acme.sh...")
     run(['systemctl', 'stop', 'nginx'], check=False)
-    cmd = f"certbot certonly --standalone -d {new} --non-interactive --agree-tos -m admin@{new}"
-    if run(cmd, shell=True, check=False).returncode == 0:
-        run(f"cp /etc/letsencrypt/live/{new}/fullchain.pem /etc/ssl/grvpn.pem", shell=True, check=False)
-        run(f"cp /etc/letsencrypt/live/{new}/privkey.pem /etc/ssl/grvpn.key", shell=True, check=False)
+    # Use acme.sh to issue new cert
+    if run(f"/root/.acme.sh/acme.sh --issue -d {new} --standalone --force", shell=True, check=False).returncode == 0:
+        run(f"/root/.acme.sh/acme.sh --install-cert -d {new} --cert-file /etc/ssl/grvpn.pem --key-file /etc/ssl/grvpn.key --fullchain-file /etc/ssl/grvpn-fullchain.pem --reloadcmd 'systemctl reload nginx'", shell=True, check=False)
         conn = get_conn()
         c = conn.cursor()
         c.execute("UPDATE settings SET value=? WHERE key='domain'", (new,))
@@ -1502,25 +1423,12 @@ def replace_domain():
         run(['systemctl', 'start', 'nginx'], check=False)
     input("Press Enter...")
 
-def regenerate_cert():
-    clear_screen()
-    domain = get_domain()
-    print(f"[🔐] Regenerating certificate for {domain}...")
-    run(['systemctl', 'stop', 'nginx'], check=False)
-    cmd = f"certbot certonly --standalone -d {domain} --non-interactive --agree-tos -m admin@{domain}"
-    if run(cmd, shell=True, check=False).returncode == 0:
-        run(f"cp /etc/letsencrypt/live/{domain}/fullchain.pem /etc/ssl/grvpn.pem", shell=True, check=False)
-        run(f"cp /etc/letsencrypt/live/{domain}/privkey.pem /etc/ssl/grvpn.key", shell=True, check=False)
-        print("[✅] Certificate regenerated!")
-    else:
-        print("[❌] Regeneration failed.")
-    run(['systemctl', 'start', 'nginx'], check=False)
-    input("Press Enter...")
-
 def renew_cert():
     clear_screen()
-    print("[🔄] Renewing certificates...")
-    run(['certbot', 'renew', '--nginx', '--non-interactive'], check=False)
+    print("[🔄] Renewing certificate via acme.sh...")
+    domain = get_domain()
+    run(f"/root/.acme.sh/acme.sh --renew -d {domain} --force", shell=True, check=False)
+    run(f"/root/.acme.sh/acme.sh --install-cert -d {domain} --cert-file /etc/ssl/grvpn.pem --key-file /etc/ssl/grvpn.key --fullchain-file /etc/ssl/grvpn-fullchain.pem --reloadcmd 'systemctl reload nginx'", shell=True, check=False)
     print("[✅] Renewal attempted. Check logs if failed.")
     input("Press Enter...")
 
@@ -1592,6 +1500,17 @@ def tls_manager():
         elif choice == '4': cert_details()
         elif choice == '5': restart_tls()
         elif choice == '6': break
+
+def regenerate_cert():
+    clear_screen()
+    domain = get_domain()
+    print(f"[🔐] Regenerating certificate for {domain}...")
+    run(['systemctl', 'stop', 'nginx'], check=False)
+    run(f"/root/.acme.sh/acme.sh --issue -d {domain} --standalone --force", shell=True, check=False)
+    run(f"/root/.acme.sh/acme.sh --install-cert -d {domain} --cert-file /etc/ssl/grvpn.pem --key-file /etc/ssl/grvpn.key --fullchain-file /etc/ssl/grvpn-fullchain.pem --reloadcmd 'systemctl reload nginx'", shell=True, check=False)
+    run(['systemctl', 'start', 'nginx'], check=False)
+    print("[✅] Certificate regenerated!")
+    input("Press Enter...")
 
 def cert_details():
     clear_screen()
@@ -2028,12 +1947,9 @@ def update_deps():
     clear_screen()
     print("[🔄] Updating system dependencies to latest versions...")
     run("apt-get update -qq && apt-get upgrade -y -qq", shell=True, check=False)
-    run(['pip3', 'install', '--upgrade', 'pip'], check=False)
-    run(['pip3', 'install', '--force-reinstall', '--quiet',
-         'cryptography==41.0.7', 'pyOpenSSL==23.2.0'], check=False)
-    result = run(['pip3', 'install', '--upgrade',
-                  'psutil', 'bcrypt', 'sqlalchemy', 'redis',
-                  'requests', 'colorama', 'prettytable', 'tabulate', 'python-dateutil', '--quiet'], check=False)
+    run(['pip3', 'install', '--upgrade',
+         'psutil', 'bcrypt', 'sqlalchemy', 'redis',
+         'requests', 'colorama', 'prettytable', 'tabulate', 'python-dateutil', '--quiet'], check=False)
     print("[✅] Dependencies updated.")
     input("Press Enter...")
 
@@ -2397,8 +2313,7 @@ cat > /etc/cron.d/grvpn << 'CRON_EOF'
 0 3 * * 0 root find /opt/grvpn/backups -type f -mtime +30 -delete > /dev/null 2>&1
 # Check expired trials every hour
 0 * * * * root sqlite3 /opt/grvpn/data/grvpn.db "UPDATE users SET is_active=0 WHERE is_trial=1 AND expires_at < datetime('now')" > /dev/null 2>&1
-# Renew certificates at 2 AM Monday
-0 2 * * 1 root certbot renew --nginx --quiet > /dev/null 2>&1
+# Renew certificates at 2 AM Monday (acme.sh handles auto-renewal via cron)
 CRON_EOF
 
 command_exists cron && { systemctl enable cron 2>/dev/null || true; systemctl restart cron 2>/dev/null || true; }
