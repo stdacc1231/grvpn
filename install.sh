@@ -1,8 +1,8 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.11 – VPN TUNNEL EDITION
-# Let's Encrypt via acme.sh – Full panel, fixes for SSH & Stunnel
-# Account info shows only WS/WSS and payloads (no SSH direct/TLS)
+# GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.13 – VPN TUNNEL EDITION
+# Python WebSocket server (no websocat) + UDPGW support
+# Fixed 502 errors, simplified CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -uo pipefail
@@ -15,7 +15,7 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-VERSION="4.0.11"
+VERSION="4.0.13"
 INSTALL_DIR="/opt/grvpn"
 DATA_DIR="${INSTALL_DIR}/data"
 CONFIG_DIR="${INSTALL_DIR}/config"
@@ -25,7 +25,8 @@ BIN_DIR="${INSTALL_DIR}/bin"
 DB_FILE="${DATA_DIR}/grvpn.db"
 PANEL_SCRIPT="${BIN_DIR}/grvpn-panel.py"
 SYMLINK="/usr/local/bin/grvpn"
-WEBSOCAT_BIN="/usr/local/bin/websocat"
+WS_BACKEND_PORT="8080"          # fixed port – no random
+UDPGW_PORT="7300"               # BadVPN UDP gateway port
 ACME_SH="$HOME/.acme.sh/acme.sh"
 
 mkdir -p /var/log/grvpn
@@ -115,9 +116,9 @@ clear
 echo -e "${CYAN}"
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════════════════╗
-║  🐱 GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.11                    ║
-║  VPN TUNNEL EDITION – acme.sh (Let's Encrypt)                     ║
-║  Fixed SSH & Stunnel, clean WebSocket-only account info           ║
+║  🐱 GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.13                    ║
+║  VPN TUNNEL EDITION – Python WebSocket + UDPGW                     ║
+║  Fixed 502 errors, ready for gaming/VoIP                          ║
 ╚══════════════════════════════════════════════════════════════════════╝
 EOF
 echo -e "${NC}"
@@ -218,6 +219,24 @@ if (( ${#FAILED_PACKAGES[@]} > 0 )); then
     log_warn "Packages that failed: ${FAILED_PACKAGES[*]}"
 fi
 
+# ─── Install BadVPN UDPGW for UDP support ─────────────────────────────
+log_info "Installing BadVPN UDPGW (UDP over TCP tunnel for gaming/VoIP)..."
+if ! command_exists badvpn-udpgw; then
+    # Build from source
+    apt_install_each cmake build-essential
+    cd /tmp
+    git clone https://github.com/ambrop72/badvpn.git 2>/dev/null || true
+    cd badvpn
+    mkdir build && cd build
+    cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1
+    make -j$(nproc)
+    make install
+    cd / && rm -rf /tmp/badvpn
+    log_ok "BadVPN UDPGW installed."
+else
+    log_ok "BadVPN UDPGW already installed."
+fi
+
 # ─── Python modules ────────────────────────────────────────────────────
 log_info "Setting up Python environment..."
 ensure_pip
@@ -235,11 +254,11 @@ if command_exists pip3; then
     log_info "Installing Python modules..."
     if ! pip3 install ${PIP_BREAK} --upgrade \
         psutil bcrypt sqlalchemy redis \
-        requests colorama prettytable tabulate python-dateutil --quiet; then
+        requests colorama prettytable tabulate python-dateutil websockets asyncio --quiet; then
         log_warn "Install with ${PIP_BREAK} failed, retrying without."
         pip3 install --upgrade \
             psutil bcrypt sqlalchemy redis \
-            requests colorama prettytable tabulate python-dateutil --quiet \
+            requests colorama prettytable tabulate python-dateutil websockets asyncio --quiet \
             || FAILED_STEPS+=("python module install")
     fi
 else
@@ -256,31 +275,6 @@ if [ ! -f "$ACME_SH" ]; then
 fi
 export PATH="$HOME/.acme.sh:$PATH"
 log_ok "acme.sh installed."
-
-# ─── websocat ──────────────────────────────────────────────────────────
-log_info "Installing websocat (latest release)..."
-WEBSOCAT_TAG=$(latest_github_release "vi/websocat" "v1.13.0")
-WEBSOCAT_URL="https://github.com/vi/websocat/releases/download/${WEBSOCAT_TAG}/websocat.x86_64-unknown-linux-musl"
-if retry wget -q -O "${WEBSOCAT_BIN}.tmp" "${WEBSOCAT_URL}"; then
-    mv "${WEBSOCAT_BIN}.tmp" "${WEBSOCAT_BIN}"
-    chmod +x "${WEBSOCAT_BIN}"
-    log_ok "websocat ${WEBSOCAT_TAG} installed."
-else
-    rm -f "${WEBSOCAT_BIN}.tmp"
-    log_err "websocat download failed."
-    FAILED_STEPS+=("websocat download")
-fi
-
-# ─── Generate random port for WebSocket backend ───────────────────────
-WS_BACKEND_PORT=""
-if [[ -f "$DB_FILE" ]]; then
-    WS_BACKEND_PORT=$(sqlite3 "$DB_FILE" "SELECT value FROM settings WHERE key='ws_backend_port';" 2>/dev/null || true)
-fi
-if [[ -z "$WS_BACKEND_PORT" ]]; then
-    WS_BACKEND_PORT=$(( RANDOM % 50000 + 10000 ))
-fi
-sqlite3 "$DB_FILE" "INSERT OR REPLACE INTO settings (key, value) VALUES ('ws_backend_port', '$WS_BACKEND_PORT');" 2>/dev/null || true
-log_ok "WebSocket backend will listen on port $WS_BACKEND_PORT."
 
 # ─── SSL certificate via acme.sh ──────────────────────────────────────
 log_info "Obtaining SSL certificate for ${DOMAIN} using acme.sh..."
@@ -327,12 +321,11 @@ $HOME/.acme.sh/acme.sh --install-cert -d "$DOMAIN" \
     fi
 }
 
-# ─── Fix: Ensure nginx is running before reload ──────────────────────
 systemctl start nginx 2>/dev/null || true
 systemctl reload nginx 2>/dev/null || true
 log_ok "Nginx reloaded with new certificate."
 
-# ─── SSH Hardening (fixed – no Match block causing validation errors) ──
+# ─── SSH Hardening (fixed) ──────────────────────────────────────────
 log_info "Configuring SSH (secure defaults)..."
 cat > /etc/ssh/sshd_config << 'EOF'
 # GRVPN Enterprise SSH Configuration – Secure by default
@@ -377,9 +370,6 @@ PermitTunnel yes
 AllowTcpForwarding yes
 GatewayPorts yes
 
-# Restrict shell for tunnel users (they cannot log in interactively)
-# This is applied per-user via Match in /etc/ssh/sshd_config.d/*.conf
-
 Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
 MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128-etm@openssh.com
 KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group-exchange-sha256
@@ -388,19 +378,15 @@ EOF
 mkdir -p /etc/ssh/sshd_config.d
 ssh-keygen -A
 
-# Remove any problematic Match block from main config (already commented out)
-# We'll also set a default ForceCommand for all users in their per-user config later.
-
 if sshd -t 2>/dev/null; then
     log_ok "sshd config validated."
 else
     log_err "sshd config validation failed! Showing error:"
     sshd -t
     FAILED_STEPS+=("sshd config validation")
-    # Continue anyway – we'll try to start SSH later
 fi
 
-# ─── Nginx Configuration ──────────────────────────────────────────────
+# ─── Nginx Configuration (proxies to backend port) ────────────────────
 log_info "Configuring Nginx with backend on port $WS_BACKEND_PORT..."
 cat > /etc/nginx/sites-available/grvpn << EOF
 server {
@@ -566,8 +552,12 @@ FAIL2BAN_EOF
 
 # ─── Firewall ──────────────────────────────────────────────────────────
 log_info "Configuring UFW..."
-for port in 22 80 443 8443 2052 2053 2082 2083 2086 2087 2095 2096 8880; do
+for port in 22 80 443 8443 2052 2053 2082 2083 2086 2087 2095 2096 8880 $UDPGW_PORT; do
     ufw allow "$port"/tcp 2>/dev/null || true
+    # Also allow UDP for UDPGW
+    if [[ "$port" == "$UDPGW_PORT" ]]; then
+        ufw allow "$port"/udp 2>/dev/null || true
+    fi
 done
 ufw --force enable 2>/dev/null || true
 
@@ -717,7 +707,7 @@ CREATE TABLE IF NOT EXISTS backups (
 INSERT OR IGNORE INTO settings (key, value) VALUES
     ('domain', 'DOMAIN_PLACEHOLDER'),
     ('server_name', 'GRVPN Enterprise Server'),
-    ('version', '4.0.11'),
+    ('version', '4.0.13'),
     ('trial_duration', '30'),
     ('default_data_limit', '0'),
     ('default_download_speed', '0'),
@@ -762,15 +752,203 @@ else
     FAILED_STEPS+=("admin user creation")
 fi
 
-# ─── Panel script (complete) ──────────────────────────────────────────
-log_info "Deploying GRVPN Enterprise Panel (VPN‑only account info)..."
+# ─── Python WebSocket-to-SSH server ──────────────────────────────────
+log_info "Deploying Python WebSocket server (ws2ssh)..."
+cat > "${BIN_DIR}/ws2ssh.py" << 'WS2SSH_EOF'
+#!/usr/bin/env python3
+"""
+GRVPN WebSocket-to-SSH Proxy – no websocat, fully custom
+Listens on port 8080 (or specified), forwards WebSocket to SSH.
+Supports payload injection, handles multiple connections.
+"""
+import asyncio
+import websockets
+import subprocess
+import os
+import sys
+import logging
+import json
+import pty
+import select
+import termios
+import fcntl
+import struct
+
+PORT = int(os.environ.get("WS_PORT", 8080))
+SSH_HOST = "127.0.0.1"
+SSH_PORT = 22
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s: %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("ws2ssh")
+
+async def handle_websocket(websocket, path):
+    """Handle incoming WebSocket connection."""
+    client_ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
+    logger.info(f"New WebSocket connection from {client_ip}")
+
+    # Send a welcome message (optional)
+    try:
+        await websocket.send("Connected to GRVPN SSH proxy\n")
+    except:
+        pass
+
+    # Create SSH process with a pseudo-terminal for better compatibility
+    # Use -tt to force pseudo-terminal allocation
+    ssh_cmd = [
+        "ssh", "-tt",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        "-p", str(SSH_PORT),
+        "-l", "root",  # default user, but we can change per connection? Not needed for now.
+        SSH_HOST
+    ]
+
+    # Use subprocess with pty for interactive shell
+    master_fd, slave_fd = pty.openpty()
+    # Set terminal size to reasonable
+    winsize = struct.pack("HHHH", 24, 80, 0, 0)
+    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
+
+    proc = await asyncio.create_subprocess_exec(
+        *ssh_cmd,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        preexec_fn=os.setsid
+    )
+
+    # Close slave fds in parent
+    os.close(slave_fd)
+
+    # Buffer for reading from master
+    def read_master():
+        try:
+            data = os.read(master_fd, 4096)
+            return data
+        except BlockingIOError:
+            return b""
+        except OSError:
+            return b""
+
+    # Set master to non-blocking
+    flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+    fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    # Loop to forward data
+    try:
+        while True:
+            # Read from WebSocket
+            try:
+                message = await asyncio.wait_for(websocket.recv(), timeout=0.01)
+                if message is None:
+                    break
+                # Write to SSH process
+                os.write(master_fd, message if isinstance(message, bytes) else message.encode())
+            except asyncio.TimeoutError:
+                pass
+            except websockets.exceptions.ConnectionClosed:
+                logger.info("WebSocket closed by client")
+                break
+
+            # Read from SSH process
+            try:
+                data = read_master()
+                if data:
+                    await websocket.send(data)
+                else:
+                    # Small delay to avoid busy loop
+                    await asyncio.sleep(0.001)
+            except Exception as e:
+                logger.error(f"Error reading from SSH: {e}")
+                break
+
+    except Exception as e:
+        logger.error(f"Handler error: {e}")
+    finally:
+        # Clean up
+        try:
+            os.close(master_fd)
+            proc.terminate()
+            await asyncio.sleep(0.1)
+            proc.kill()
+        except:
+            pass
+        logger.info(f"Connection closed for {client_ip}")
+
+async def main():
+    """Start the WebSocket server."""
+    logger.info(f"Starting WebSocket-to-SSH proxy on port {PORT}")
+    try:
+        server = await websockets.serve(handle_websocket, "0.0.0.0", PORT)
+        logger.info(f"WebSocket server listening on ws://0.0.0.0:{PORT}")
+        await server.wait_closed()
+    except Exception as e:
+        logger.error(f"Server error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+WS2SSH_EOF
+chmod +x "${BIN_DIR}/ws2ssh.py"
+
+# ─── Systemd service for WebSocket proxy ────────────────────────────
+log_info "Creating WebSocket systemd service..."
+cat > /etc/systemd/system/ws2ssh.service << EOF
+[Unit]
+Description=GRVPN WebSocket-to-SSH Proxy (Python)
+After=network.target ssh.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Environment="WS_PORT=$WS_BACKEND_PORT"
+ExecStart=/usr/bin/python3 ${BIN_DIR}/ws2ssh.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ws2ssh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ─── Systemd service for BadVPN UDPGW ──────────────────────────────
+log_info "Creating BadVPN UDPGW systemd service..."
+cat > /etc/systemd/system/badvpn-udpgw.service << EOF
+[Unit]
+Description=BadVPN UDP Gateway (UDP over TCP tunnel)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 0.0.0.0:$UDPGW_PORT --max-clients 1000
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=badvpn
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ─── Panel script (simplified) ──────────────────────────────────────
+log_info "Deploying GRVPN Enterprise Panel (simplified)..."
 cat > "${PANEL_SCRIPT}" << 'PANEL_EOF'
 #!/usr/bin/env python3
 """
-GRVPN ENTERPRISE SSH SERVER MANAGER v4.0.11 – VPN TUNNEL EDITION
-Account info shows only WebSocket endpoints and payload examples.
+GRVPN ENTERPRISE SSH SERVER MANAGER – VPN TUNNEL EDITION
+Simplified CLI – only essential operations.
 """
-import os, sys, sqlite3, subprocess, time, json, uuid, socket, random
+import os, sys, sqlite3, subprocess, time, json, uuid, socket
 from datetime import datetime, timedelta
 
 try:
@@ -785,7 +963,7 @@ except ImportError as e:
 
 INSTALL_DIR = '/opt/grvpn'
 DB = f'{INSTALL_DIR}/data/grvpn.db'
-VERSION = '4.0.11'
+VERSION = '4.0.13'
 
 def get_conn():
     return sqlite3.connect(DB)
@@ -836,7 +1014,7 @@ def get_free_port(base):
         if row[0]: used.add(row[0])
         if row[1]: used.add(row[1])
     conn.close()
-    reserved = [22,80,443,8080,8443,2052,2053,2082,2083,2086,2087,2095,2096,8880]
+    reserved = [22,80,443,8080,8443,2052,2053,2082,2083,2086,2087,2095,2096,8880,7300]
     for p in reserved:
         used.add(p)
     port = base
@@ -901,7 +1079,7 @@ def print_account_info(username, ssh_port, ws_port, data_limit, dl_speed, ul_spe
     expiry_str = expires_at if expires_at else "Never"
     
     print("\n" + "="*50)
-    print("🐱 GRVPN ACCOUNT INFORMATION (Open Tunnel VPN)")
+    print("🐱 GRVPN ACCOUNT INFORMATION")
     print("="*50)
     print(f"IP/Host        : {server_ip}")
     print(f"Domain         : {domain}")
@@ -909,17 +1087,15 @@ def print_account_info(username, ssh_port, ws_port, data_limit, dl_speed, ul_spe
     if password:
         print(f"Password       : {password}")
     else:
-        print("Password       : (hidden – use change password)")
-    print(f"Data Limit     : {data_limit} GB" if data_limit > 0 else "Data Limit     : ∞ (unlimited)")
-    print(f"Download Speed : {dl_speed} Mbps" if dl_speed > 0 else "Download Speed : ∞ (unlimited)")
-    print(f"Upload Speed   : {ul_speed} Mbps" if ul_speed > 0 else "Upload Speed   : ∞ (unlimited)")
-    print(f"IP Limit       : {ip_limit}" if ip_limit > 0 else "IP Limit       : ∞ (unlimited)")
+        print("Password       : (hidden)")
+    print(f"Data Limit     : {data_limit} GB" if data_limit > 0 else "Data Limit     : ∞")
+    print(f"Download Speed : {dl_speed} Mbps" if dl_speed > 0 else "Download Speed : ∞")
+    print(f"Upload Speed   : {ul_speed} Mbps" if ul_speed > 0 else "Upload Speed   : ∞")
+    print(f"IP Limit       : {ip_limit}" if ip_limit > 0 else "IP Limit       : ∞")
     print(f"Expires        : {expiry_str}")
-    print("\n📡 WEBSOCKET CONNECTION (with payload)")
-    print("----------------------------")
-    print("HTTP (WS):")
+    print("\n📡 WEBSOCKET ENDPOINTS")
+    print("---------------------")
     print(f"  ws://{domain}/")
-    print("HTTPS (WSS):")
     print(f"  wss://{domain}/")
     print("\n📋 PAYLOAD EXAMPLES")
     print("------------------")
@@ -927,6 +1103,8 @@ def print_account_info(username, ssh_port, ws_port, data_limit, dl_speed, ul_spe
     print(f"  GET wss://bug.com/ HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]")
     print("For WS (HTTP):")
     print(f"  GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]")
+    print("\n🔹 UDP Gateway (for gaming/VoIP):")
+    print(f"  UDPGW port: 7300 (connect to this port for UDP forwarding)")
     print("="*50)
 
 # ================== MAIN MENU ==================
@@ -937,35 +1115,27 @@ def main_menu():
 ╔══════════════════════════════════════════════════════════════════════╗
 ║  🐱 GRVPN ENTERPRISE SSH SERVER MANAGER v{VERSION}                  ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║  1.  👤 SSH Manager                                                 ║
+║  1.  👤 SSH Manager (users, limits, etc.)                          ║
 ║  2.  🌐 Domain Manager                                              ║
-║  3.  🔒 TLS Manager                                                 ║
-║  4.  🌍 Nginx Manager                                               ║
-║  5.  📋 Banner Manager                                              ║
-║  6.  📊 Session Monitor                                             ║
-║  7.  📈 Server Dashboard                                            ║
-║  8.  💾 Backup Manager                                              ║
-║  9.  🔄 Update Manager                                              ║
-║  10. 🛡️ Security Manager                                            ║
-║  11. 📜 Logs                                                        ║
-║  12. ⚙️  System Services                                            ║
-║  13. 🚪 Exit                                                       ║
+║  3.  📊 Session Monitor                                             ║
+║  4.  📈 Server Dashboard                                            ║
+║  5.  💾 Backup Manager                                              ║
+║  6.  🔄 Update Manager                                              ║
+║  7.  🛡️ Security (firewall, IP blacklist)                          ║
+║  8.  📜 Logs                                                        ║
+║  9.  🚪 Exit                                                       ║
 ╚══════════════════════════════════════════════════════════════════════╝
         """)
         choice = input("🐱 Choice: ").strip()
         if choice == '1': ssh_manager()
         elif choice == '2': domain_manager()
-        elif choice == '3': tls_manager()
-        elif choice == '4': nginx_manager()
-        elif choice == '5': banner_manager()
-        elif choice == '6': session_monitor()
-        elif choice == '7': server_dashboard()
-        elif choice == '8': backup_manager()
-        elif choice == '9': update_manager()
-        elif choice == '10': security_manager()
-        elif choice == '11': logs_viewer()
-        elif choice == '12': system_services()
-        elif choice == '13':
+        elif choice == '3': session_monitor()
+        elif choice == '4': server_dashboard()
+        elif choice == '5': backup_manager()
+        elif choice == '6': update_manager()
+        elif choice == '7': security_manager()
+        elif choice == '8': logs_viewer()
+        elif choice == '9':
             print("\n[👋] Goodbye!")
             sys.exit(0)
 
@@ -980,19 +1150,16 @@ def ssh_manager():
 ║  1.  List Users                                                     ║
 ║  2.  Create User                                                    ║
 ║  3.  Create Trial User                                              ║
-║  4.  Edit User (all fields)                                         ║
+║  4.  Edit User (fields)                                             ║
 ║  5.  Delete User                                                    ║
 ║  6.  Change Password                                                ║
-║  7.  Lock Account                                                   ║
-║  8.  Unlock Account                                                 ║
-║  9.  View Account                                                   ║
-║  10. View Login History                                             ║
-║  11. Disconnect User                                                ║
-║  12. Disconnect All Sessions                                        ║
-║  13. Backup Users                                                   ║
-║  14. Restore Users                                                  ║
-║  15. Toggle Auto-Kill on IP Limit                                   ║
-║  16. Back to Main                                                   ║
+║  7.  Lock/Unlock Account                                            ║
+║  8.  View Account                                                   ║
+║  9.  View Login History                                             ║
+║  10. Disconnect User                                                ║
+║  11. Disconnect All Sessions                                        ║
+║  12. Backup/Restore Users                                           ║
+║  13. Back to Main                                                   ║
 ╚══════════════════════════════════════════════════════════════════════╝
         """)
         choice = input("🐱 Choice: ").strip()
@@ -1002,16 +1169,13 @@ def ssh_manager():
         elif choice == '4': edit_user()
         elif choice == '5': delete_user()
         elif choice == '6': change_password()
-        elif choice == '7': lock_account()
-        elif choice == '8': unlock_account()
-        elif choice == '9': view_account()
-        elif choice == '10': login_history()
-        elif choice == '11': disconnect_user()
-        elif choice == '12': disconnect_all()
-        elif choice == '13': backup_users()
-        elif choice == '14': restore_users()
-        elif choice == '15': toggle_kill_on_iplimit()
-        elif choice == '16': break
+        elif choice == '7': lock_unlock()
+        elif choice == '8': view_account()
+        elif choice == '9': login_history()
+        elif choice == '10': disconnect_user()
+        elif choice == '11': disconnect_all()
+        elif choice == '12': backup_restore()
+        elif choice == '13': break
 
 def list_users():
     clear_screen()
@@ -1081,7 +1245,6 @@ def create_user():
     conn.commit()
     conn.close()
 
-    # Create per-user SSH config with ForceCommand to restrict shell
     with open(f'/etc/ssh/sshd_config.d/{username}.conf', 'w') as f:
         f.write(f"Match User {username}\n")
         f.write(f"    Port {ssh_port}\n")
@@ -1231,7 +1394,7 @@ def change_password():
     print("[✅] Password changed!")
     input("Press Enter...")
 
-def lock_account():
+def lock_unlock():
     clear_screen()
     username = input("Username: ").strip()
     user = get_user(username)
@@ -1239,31 +1402,25 @@ def lock_account():
         print("[❌] User not found!")
         input("Press Enter...")
         return
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE users SET is_active=0 WHERE id=?", (user['id'],))
-    c.execute("UPDATE sessions SET is_active=0 WHERE user_id=? AND is_active=1", (user['id'],))
-    conn.commit()
-    conn.close()
-    log_activity(user['id'], 'account_locked')
-    print(f"[🔒] Account {username} locked!")
-    input("Press Enter...")
-
-def unlock_account():
-    clear_screen()
-    username = input("Username: ").strip()
-    user = get_user(username)
-    if not user:
-        print("[❌] User not found!")
-        input("Press Enter...")
-        return
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE users SET is_active=1 WHERE id=?", (user['id'],))
-    conn.commit()
-    conn.close()
-    log_activity(user['id'], 'account_unlocked')
-    print(f"[🔓] Account {username} unlocked!")
+    if user['is_active']:
+        # Lock
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("UPDATE users SET is_active=0 WHERE id=?", (user['id'],))
+        c.execute("UPDATE sessions SET is_active=0 WHERE user_id=? AND is_active=1", (user['id'],))
+        conn.commit()
+        conn.close()
+        log_activity(user['id'], 'account_locked')
+        print(f"[🔒] Account {username} locked!")
+    else:
+        # Unlock
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("UPDATE users SET is_active=1 WHERE id=?", (user['id'],))
+        conn.commit()
+        conn.close()
+        log_activity(user['id'], 'account_unlocked')
+        print(f"[🔓] Account {username} unlocked!")
     input("Press Enter...")
 
 def view_account():
@@ -1336,33 +1493,25 @@ def disconnect_all():
     print("[✅] All users disconnected!")
     input("Press Enter...")
 
-def backup_users():
+def backup_restore():
     clear_screen()
-    backup_path = f"/opt/grvpn/backups/users_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-    run(['cp', DB, backup_path], check=False)
-    print(f"[✅] Users backed up: {backup_path}")
-    input("Press Enter...")
-
-def restore_users():
-    clear_screen()
-    backup = input("Backup path: ").strip()
-    if not os.path.exists(backup):
-        print("[❌] Backup not found!")
-        input("Press Enter...")
-        return
-    if input("Restore users? (y/n): ").strip().lower() != 'y':
-        return
-    run(['cp', backup, DB], check=False)
-    run(['systemctl', 'reload', 'ssh'], check=False)
-    print("[✅] Users restored!")
-    input("Press Enter...")
-
-def toggle_kill_on_iplimit():
-    current = get_setting('kill_on_ip_limit', '1')
-    new_val = '0' if current == '1' else '1'
-    set_setting('kill_on_ip_limit', new_val)
-    status = "ENABLED" if new_val == '1' else "DISABLED"
-    print(f"[🔄] Auto-kill on IP limit: {status}")
+    print("1. Backup users")
+    print("2. Restore users")
+    ch = input("Choice: ").strip()
+    if ch == '1':
+        backup_path = f"/opt/grvpn/backups/users_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        run(['cp', DB, backup_path], check=False)
+        print(f"[✅] Users backed up: {backup_path}")
+    elif ch == '2':
+        backup = input("Backup path: ").strip()
+        if not os.path.exists(backup):
+            print("[❌] Backup not found!")
+        else:
+            if input("Restore users? (y/n): ").strip().lower() != 'y':
+                return
+            run(['cp', backup, DB], check=False)
+            run(['systemctl', 'reload', 'ssh'], check=False)
+            print("[✅] Users restored!")
     input("Press Enter...")
 
 # ================== DOMAIN MANAGER ==================
@@ -1382,7 +1531,7 @@ def domain_manager():
 ║  7.  Validate Certificate                                           ║
 ║  8.  Display Certificate Expiry                                     ║
 ║  9.  Restart Affected Services                                      ║
-║  10. Back to Main                                                   ║
+║  10. Back                                                          ║
 ╚══════════════════════════════════════════════════════════════════════╝
         """)
         choice = input("🐱 Choice: ").strip()
@@ -1497,188 +1646,9 @@ def cert_expiry():
 
 def restart_services():
     clear_screen()
-    for svc in ['nginx', 'ssh', 'stunnel5']:
+    for svc in ['nginx', 'ssh', 'stunnel5', 'ws2ssh', 'badvpn-udpgw']:
         run(['systemctl', 'restart', svc], check=False)
         print(f"[✅] {svc} restarted!")
-    input("Press Enter...")
-
-# ================== TLS MANAGER ==================
-def tls_manager():
-    while True:
-        clear_screen()
-        print("""
-╔══════════════════════════════════════════════════════════════════════╗
-║  🔒 TLS MANAGER                                                    ║
-╠══════════════════════════════════════════════════════════════════════╣
-║  1.  Regenerate Certificate                                         ║
-║  2.  Install Custom Certificate                                     ║
-║  3.  Install Private Key                                            ║
-║  4.  View Certificate Details                                       ║
-║  5.  Restart TLS Services                                           ║
-║  6.  Back to Main                                                   ║
-╚══════════════════════════════════════════════════════════════════════╝
-        """)
-        choice = input("🐱 Choice: ").strip()
-        if choice == '1': regenerate_cert()
-        elif choice == '2': install_custom_cert()
-        elif choice == '3': install_custom_key()
-        elif choice == '4': cert_details()
-        elif choice == '5': restart_tls()
-        elif choice == '6': break
-
-def regenerate_cert():
-    clear_screen()
-    domain = get_domain()
-    print(f"[🔐] Regenerating certificate for {domain}...")
-    run(['systemctl', 'stop', 'nginx'], check=False)
-    run(f"/root/.acme.sh/acme.sh --issue -d {domain} --standalone --force", shell=True, check=False)
-    run(f"/root/.acme.sh/acme.sh --install-cert -d {domain} --cert-file /etc/ssl/grvpn.pem --key-file /etc/ssl/grvpn.key --fullchain-file /etc/ssl/grvpn-fullchain.pem --reloadcmd 'systemctl reload nginx'", shell=True, check=False)
-    run(['systemctl', 'start', 'nginx'], check=False)
-    print("[✅] Certificate regenerated!")
-    input("Press Enter...")
-
-def cert_details():
-    clear_screen()
-    run(['openssl', 'x509', '-in', '/etc/ssl/grvpn.pem', '-noout', '-text'], check=False)
-    input("\nPress Enter...")
-
-def restart_tls():
-    for svc in ['nginx', 'stunnel5']:
-        run(['systemctl', 'restart', svc], check=False)
-        print(f"[✅] {svc} restarted!")
-    input("Press Enter...")
-
-# ================== NGINX MANAGER ==================
-def nginx_manager():
-    while True:
-        clear_screen()
-        print("""
-╔══════════════════════════════════════════════════════════════════════╗
-║  🌍 NGINX MANAGER                                                  ║
-╠══════════════════════════════════════════════════════════════════════╣
-║  1.  Reload Nginx                                                   ║
-║  2.  Restart Nginx                                                  ║
-║  3.  Validate Configuration                                         ║
-║  4.  View Error Logs                                                ║
-║  5.  Show Current Config                                            ║
-║  6.  Back to Main                                                   ║
-╚══════════════════════════════════════════════════════════════════════╝
-        """)
-        choice = input("🐱 Choice: ").strip()
-        if choice == '1': reload_nginx()
-        elif choice == '2': restart_nginx()
-        elif choice == '3': validate_nginx()
-        elif choice == '4': view_nginx_logs()
-        elif choice == '5': show_nginx_config()
-        elif choice == '6': break
-
-def reload_nginx():
-    run(['systemctl', 'reload', 'nginx'], check=False)
-    print("[✅] Nginx reloaded!")
-    input("Press Enter...")
-
-def restart_nginx():
-    run(['systemctl', 'restart', 'nginx'], check=False)
-    print("[✅] Nginx restarted!")
-    input("Press Enter...")
-
-def validate_nginx():
-    run(['nginx', '-t'], check=False)
-    input("\nPress Enter...")
-
-def view_nginx_logs():
-    clear_screen()
-    lines = input("Lines (default 50): ").strip() or "50"
-    run(['tail', f'-{lines}', '/var/log/nginx/error.log'], check=False)
-    input("\nPress Enter...")
-
-def show_nginx_config():
-    clear_screen()
-    run(['cat', '/etc/nginx/sites-available/grvpn'], check=False)
-    input("\nPress Enter...")
-
-# ================== BANNER MANAGER ==================
-def banner_manager():
-    while True:
-        clear_screen()
-        print("""
-╔══════════════════════════════════════════════════════════════════════╗
-║  📋 BANNER MANAGER                                                 ║
-╠══════════════════════════════════════════════════════════════════════╣
-║  1.  Set Global Banner                                              ║
-║  2.  Set User Banner                                                ║
-║  3.  View Banner                                                    ║
-║  4.  Reset to Default                                               ║
-║  5.  Back to Main                                                   ║
-╚══════════════════════════════════════════════════════════════════════╝
-        """)
-        choice = input("🐱 Choice: ").strip()
-        if choice == '1': set_global_banner()
-        elif choice == '2': set_user_banner()
-        elif choice == '3': view_banner()
-        elif choice == '4': reset_banner()
-        elif choice == '5': break
-
-def set_global_banner():
-    clear_screen()
-    print("Enter banner (press Ctrl+D when done):")
-    lines = []
-    try:
-        while True:
-            line = input()
-            lines.append(line)
-    except EOFError:
-        pass
-    banner = '\n'.join(lines)
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("REPLACE INTO settings(key, value) VALUES('global_banner', ?)", (banner,))
-    conn.commit()
-    conn.close()
-    print("[✅] Global banner set!")
-    input("Press Enter...")
-
-def set_user_banner():
-    clear_screen()
-    username = input("Username: ").strip()
-    user = get_user(username)
-    if not user:
-        print("[❌] User not found!")
-        input("Press Enter...")
-        return
-    banner = input("Banner: ").strip()
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE users SET ssh_banner=? WHERE id=?", (banner, user['id']))
-    conn.commit()
-    conn.close()
-    print("[✅] User banner set!")
-    input("Press Enter...")
-
-def view_banner():
-    clear_screen()
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key='global_banner'")
-    result = c.fetchone()
-    conn.close()
-    if result:
-        print(f"\n📋 GLOBAL BANNER:\n{result[0]}")
-    else:
-        print("[ℹ️] No global banner set")
-    input("\nPress Enter...")
-
-def reset_banner():
-    clear_screen()
-    if input("Reset to default banner? (y/n): ").strip().lower() != 'y':
-        return
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM settings WHERE key='global_banner'")
-    c.execute("UPDATE users SET ssh_banner=NULL")
-    conn.commit()
-    conn.close()
-    print("[✅] Banner reset to default!")
     input("Press Enter...")
 
 # ================== SESSION MONITOR ==================
@@ -1694,7 +1664,7 @@ def session_monitor():
 ║  3.  Disconnect Session                                             ║
 ║  4.  Disconnect All Sessions                                        ║
 ║  5.  Auto-Refresh (5s)                                              ║
-║  6.  Back to Main                                                   ║
+║  6.  Back                                                          ║
 ╚══════════════════════════════════════════════════════════════════════╝
         """)
         choice = input("🐱 Choice: ").strip()
@@ -1842,7 +1812,7 @@ def backup_manager():
 ║  4.  List Backups                                                   ║
 ║  5.  Restore Backup                                                 ║
 ║  6.  Clean Old Backups                                              ║
-║  7.  Back to Main                                                   ║
+║  7.  Back                                                          ║
 ╚══════════════════════════════════════════════════════════════════════╝
         """)
         choice = input("🐱 Choice: ").strip()
@@ -1935,7 +1905,7 @@ def update_manager():
 ║  3.  Update Dependencies (apt + pip, latest versions)                ║
 ║  4.  Restart Services After Update                                 ║
 ║  5.  View Update/Install Log                                        ║
-║  6.  Back to Main                                                   ║
+║  6.  Back                                                          ║
 ╚══════════════════════════════════════════════════════════════════════╝
         """)
         choice = input("🐱 Choice: ").strip()
@@ -1974,13 +1944,13 @@ def update_deps():
     run("apt-get update -qq && apt-get upgrade -y -qq", shell=True, check=False)
     run(['pip3', 'install', '--upgrade',
          'psutil', 'bcrypt', 'sqlalchemy', 'redis',
-         'requests', 'colorama', 'prettytable', 'tabulate', 'python-dateutil', '--quiet'], check=False)
+         'requests', 'colorama', 'prettytable', 'tabulate', 'python-dateutil', 'websockets', 'asyncio', '--quiet'], check=False)
     print("[✅] Dependencies updated.")
     input("Press Enter...")
 
 def restart_after_update():
     clear_screen()
-    for svc in ['nginx', 'ssh', 'stunnel5']:
+    for svc in ['nginx', 'ssh', 'stunnel5', 'ws2ssh', 'badvpn-udpgw']:
         run(['systemctl', 'restart', svc], check=False)
         print(f"[✅] {svc} restarted!")
     input("Press Enter...")
@@ -2010,7 +1980,7 @@ def security_manager():
 ║  6.  Remove IP from Blacklist                                       ║
 ║  7.  View Fail2ban Status                                           ║
 ║  8.  Restart Fail2ban                                               ║
-║  9.  Back to Main                                                   ║
+║  9.  Back                                                          ║
 ╚══════════════════════════════════════════════════════════════════════╝
         """)
         choice = input("🐱 Choice: ").strip()
@@ -2115,10 +2085,10 @@ def logs_viewer():
 ║  2.  Authentication Logs                                            ║
 ║  3.  Nginx Error Logs                                               ║
 ║  4.  Stunnel Logs                                                   ║
-║  5.  Installer Logs                                                 ║
-║  6.  System Logs                                                    ║
-║  7.  WebSocket Logs                                                 ║
-║  8.  Back to Main                                                   ║
+║  5.  WebSocket Proxy Logs (ws2ssh)                                 ║
+║  6.  Installer Logs                                                 ║
+║  7.  System Logs                                                    ║
+║  8.  Back                                                          ║
 ╚══════════════════════════════════════════════════════════════════════╝
         """)
         choice = input("🐱 Choice: ").strip()
@@ -2126,9 +2096,9 @@ def logs_viewer():
         elif choice == '2': view_auth_logs()
         elif choice == '3': view_nginx_logs()
         elif choice == '4': view_tls_logs()
-        elif choice == '5': view_installer_logs()
-        elif choice == '6': view_system_logs()
-        elif choice == '7': view_ws_logs()
+        elif choice == '5': view_ws_logs()
+        elif choice == '6': view_installer_logs()
+        elif choice == '7': view_system_logs()
         elif choice == '8': break
 
 def view_ssh_logs():
@@ -2149,6 +2119,12 @@ def view_tls_logs():
     run(['tail', f'-{lines}', '/var/log/stunnel5.log'], check=False)
     input("\nPress Enter...")
 
+def view_ws_logs():
+    clear_screen()
+    lines = input("Lines (default 50): ").strip() or "50"
+    run(['journalctl', '-u', 'ws2ssh', '-n', lines, '--no-pager'], check=False)
+    input("\nPress Enter...")
+
 def view_installer_logs():
     clear_screen()
     if os.path.exists('/var/log/grvpn/install.log'):
@@ -2162,123 +2138,6 @@ def view_system_logs():
     clear_screen()
     lines = input("Lines (default 50): ").strip() or "50"
     run(['journalctl', '-n', lines, '--no-pager'], check=False)
-    input("\nPress Enter...")
-
-def view_ws_logs():
-    clear_screen()
-    if os.path.exists('/var/log/grvpn/websocat.log'):
-        lines = input("Lines (default 50): ").strip() or "50"
-        run(['tail', f'-{lines}', '/var/log/grvpn/websocat.log'], check=False)
-    else:
-        print("[ℹ️] No WebSocket log found (check `journalctl -u websocat` instead).")
-    input("\nPress Enter...")
-
-# ================== SYSTEM SERVICES ==================
-def system_services():
-    while True:
-        clear_screen()
-        print("""
-╔══════════════════════════════════════════════════════════════════════╗
-║  ⚙️  SYSTEM SERVICES                                                ║
-╠══════════════════════════════════════════════════════════════════════╣
-║  1.  View All Services                                               ║
-║  2.  Start Service                                                   ║
-║  3.  Stop Service                                                    ║
-║  4.  Restart Service                                                 ║
-║  5.  Reload Service                                                  ║
-║  6.  Enable Service                                                  ║
-║  7.  Disable Service                                                 ║
-║  8.  View Service Status                                             ║
-║  9.  Back to Main                                                    ║
-╚══════════════════════════════════════════════════════════════════════╝
-        """)
-        choice = input("🐱 Choice: ").strip()
-        if choice == '1': view_all_services()
-        elif choice == '2': start_service()
-        elif choice == '3': stop_service()
-        elif choice == '4': restart_service()
-        elif choice == '5': reload_service()
-        elif choice == '6': enable_service()
-        elif choice == '7': disable_service()
-        elif choice == '8': service_status()
-        elif choice == '9': break
-
-def view_all_services():
-    clear_screen()
-    services = ['nginx', 'ssh', 'stunnel5', 'fail2ban', 'websocat']
-    table = PrettyTable()
-    table.field_names = ["Service", "Status", "Enabled"]
-    for svc in services:
-        status = run(['systemctl', 'is-active', svc], capture_output=True, check=False).stdout
-        enabled = run(['systemctl', 'is-enabled', svc], capture_output=True, check=False).stdout
-        status = status.decode().strip() if status else "unknown"
-        enabled = enabled.decode().strip() if enabled else "unknown"
-        table.add_row([svc, "✅" if status == "active" else "❌", "✅" if enabled == "enabled" else "❌"])
-    print(table)
-    input("\nPress Enter...")
-
-ALLOWED_SERVICES = {'nginx', 'ssh', 'stunnel5', 'fail2ban', 'websocat', 'cron'}
-
-def _service_prompt():
-    svc = input("Service name: ").strip()
-    if svc not in ALLOWED_SERVICES:
-        print(f"[❌] '{svc}' is not a GRVPN-managed service. Allowed: {', '.join(sorted(ALLOWED_SERVICES))}")
-        return None
-    return svc
-
-def start_service():
-    svc = _service_prompt()
-    if not svc:
-        input("Press Enter..."); return
-    run(['systemctl', 'start', svc], check=False)
-    print(f"[✅] {svc} started!")
-    input("Press Enter...")
-
-def stop_service():
-    svc = _service_prompt()
-    if not svc:
-        input("Press Enter..."); return
-    run(['systemctl', 'stop', svc], check=False)
-    print(f"[✅] {svc} stopped!")
-    input("Press Enter...")
-
-def restart_service():
-    svc = _service_prompt()
-    if not svc:
-        input("Press Enter..."); return
-    run(['systemctl', 'restart', svc], check=False)
-    print(f"[✅] {svc} restarted!")
-    input("Press Enter...")
-
-def reload_service():
-    svc = _service_prompt()
-    if not svc:
-        input("Press Enter..."); return
-    run(['systemctl', 'reload', svc], check=False)
-    print(f"[✅] {svc} reloaded!")
-    input("Press Enter...")
-
-def enable_service():
-    svc = _service_prompt()
-    if not svc:
-        input("Press Enter..."); return
-    run(['systemctl', 'enable', svc], check=False)
-    print(f"[✅] {svc} enabled!")
-    input("Press Enter...")
-
-def disable_service():
-    svc = _service_prompt()
-    if not svc:
-        input("Press Enter..."); return
-    run(['systemctl', 'disable', svc], check=False)
-    print(f"[✅] {svc} disabled!")
-    input("Press Enter...")
-
-def service_status():
-    svc = _service_prompt()
-    if not svc:
-        input("Press Enter..."); return
-    run(['systemctl', 'status', svc, '--no-pager'], check=False)
     input("\nPress Enter...")
 
 # ================== RUN ==================
@@ -2300,33 +2159,12 @@ python3 /opt/grvpn/bin/grvpn-panel.py "$@"
 SYM_EOF
 chmod +x "${SYMLINK}"
 
-# ─── WebSocket systemd service with random port ──────────────────────
-log_info "Creating WebSocket systemd service on port $WS_BACKEND_PORT..."
-cat > /etc/systemd/system/websocat.service << EOF
-[Unit]
-Description=GRVPN WebSocket Proxy (backend port $WS_BACKEND_PORT)
-After=network.target ssh.service
-Wants=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/websocat -s 0.0.0.0:$WS_BACKEND_PORT -- sh -c "ssh -o StrictHostKeyChecking=no localhost"
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=websocat
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# ─── Cron watchdog for websocat ──────────────────────────────────────
-log_info "Adding cron watchdog for websocat..."
+# ─── Cron watchdog for Python WebSocket and UDPGW ──────────────────
+log_info "Adding cron watchdog for ws2ssh and badvpn..."
 cat > /etc/cron.d/grvpn-watchdog << 'WATCHDOG_EOF'
-# Every minute, restart websocat if it's not running
-* * * * * root systemctl is-active --quiet websocat || systemctl restart websocat
+# Every minute, restart services if they are not running
+* * * * * root systemctl is-active --quiet ws2ssh || systemctl restart ws2ssh
+* * * * * root systemctl is-active --quiet badvpn-udpgw || systemctl restart badvpn-udpgw
 WATCHDOG_EOF
 chmod 644 /etc/cron.d/grvpn-watchdog
 
@@ -2346,26 +2184,12 @@ command_exists cron && { systemctl enable cron 2>/dev/null || true; systemctl re
 # ─── Start services ──────────────────────────────────────────────────
 log_info "Starting services..."
 systemctl daemon-reload
-for svc in nginx ssh stunnel5 fail2ban websocat; do
-    # Try to start stunnel5 or stunnel4
-    if [[ "$svc" == "stunnel5" ]]; then
-        if ! systemctl start stunnel5 2>/dev/null; then
-            if systemctl start stunnel4 2>/dev/null; then
-                log_ok "stunnel4 started (as stunnel5)."
-            else
-                log_warn "stunnel5 failed to start."
-                FAILED_STEPS+=("service: stunnel5")
-            fi
-        else
-            log_ok "stunnel5 running."
-        fi
+for svc in nginx ssh stunnel5 ws2ssh badvpn-udpgw fail2ban; do
+    if systemctl enable "$svc" 2>/dev/null && systemctl restart "$svc" 2>/dev/null; then
+        log_ok "${svc} running."
     else
-        if systemctl enable "$svc" 2>/dev/null && systemctl restart "$svc" 2>/dev/null; then
-            log_ok "${svc} running."
-        else
-            log_warn "${svc} did not start cleanly — check 'systemctl status ${svc}'."
-            FAILED_STEPS+=("service: ${svc}")
-        fi
+        log_warn "${svc} did not start cleanly — check 'systemctl status ${svc}'."
+        FAILED_STEPS+=("service: ${svc}")
     fi
 done
 
@@ -2381,7 +2205,8 @@ echo "║  🔐 Admin credentials saved to: /opt/grvpn/data/.admin_credentials  
 fi
 echo "║                                                                      ║"
 echo "║  🌐 Domain: ${DOMAIN}"
-echo "║  🔄 WebSocket backend port: $WS_BACKEND_PORT (random)                ║"
+echo "║  🔹 WebSocket backend port: 8080 (fixed)                             ║"
+echo "║  🔹 UDPGW port: 7300 (UDP over TCP tunnel)                           ║"
 echo "║                                                                      ║"
 echo "║  📡 WEBSOCKET CONNECTION (with payload):                             ║"
 echo "║  WS: ws://${DOMAIN}/                                                 ║"
